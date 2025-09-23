@@ -5,6 +5,7 @@ from typing import Dict, Optional, Tuple
 from pathlib import Path
 import os
 from config import get_config
+from agent.debug import dispInfo, debug
 
 # ---------- 底层长驻 PowerShell 会话 ----------
 class PowerShellSession:
@@ -159,6 +160,7 @@ User request: {nl_instruction}
 _sessions: Dict[str, PowerShellSession] = {}
 
 
+@dispInfo("run_single")
 async def run_single(
     nl_instruction: str,
     timeout: int = 60,
@@ -200,4 +202,10 @@ async def run_single(
 
     # 2. 执行
     result = await session.run(nl_instruction, timeout=timeout)
+    try:
+        # 记录关键输出，便于上层查看“真实命令”和标准输出
+        debug.note("executed_command", result.get("command"))
+        debug.note("stdout", (result.get("stdout") or "")[:800])
+    except Exception:
+        pass
     return current_token, result
