@@ -54,6 +54,77 @@ def observe_v2(task: Task, current_index: int, last_result: Optional[StepResult]
     return data
 
 
+def extract_readme_info(readme_text: str) -> Dict[str, Any]:
+    """
+    todo 这一部分可以抽象成工具
+    从 README 文本中提取结构化信息，返回字典。
+    目标字段（可能的示例）：
+    - project_name: 项目/包名
+    - description: 简短描述
+    - install_cmds: 安装命令列表（pip/pipx/conda/poetry/pdm）
+    - run_cmds: 运行/启动命令列表（python -m, uvicorn, streamlit, pytest 等）
+    - requirements: 关键依赖或最低 Python 版本
+    - entry_points: 入口（命令/模块）
+    - links: 外链（文档/主页/issue）
+    """
+    info: Dict[str, Any] = {}
+    text = (readme_text or "").strip()
+    if not text:
+        return info
+
+    import re
+    # 粗略提取项目名（首行标题）
+    m = re.search(r"^\s*#\s+(.+)$", text, re.MULTILINE)
+    if m:
+        info["project_name"] = m.group(1).strip()
+
+    # 简短描述：标题下的第一段非空文本
+    try:
+        lines = text.splitlines()
+        desc = []
+        hit_title = False
+        for line in lines:
+            if not hit_title and re.match(r"^\s*#\s+", line):
+                hit_title = True
+                continue
+            if hit_title:
+                if line.strip() == "":
+                    if desc:
+                        break
+                    else:
+                        continue
+                desc.append(line.strip())
+        if desc:
+            info["description"] = " ".join(desc)[:400]
+    except Exception:
+        pass
+
+    # 命令提取
+    install_cmds = re.findall(r"(?mi)^(?:\s*[-*]\s*)?(pip(?:x)?|conda|poetry|pdm)\s+[^\n]+$", text)
+    run_cmds = re.findall(r"(?mi)^(?:\s*[-*]\s*)?(python\s+-m\s+\S+|pytest\b[^\n]*|uvicorn\b[^\n]*|streamlit\b[^\n]*|gunicorn\b[^\n]*|make\s+\S+)\s*$", text)
+    if install_cmds:
+        info["install_cmds"] = list({cmd.strip() for cmd in install_cmds})
+    if run_cmds:
+        info["run_cmds"] = list({cmd.strip() for cmd in run_cmds})
+
+    # Python 版本/依赖的线索
+    pyver = re.search(r"(?i)python\s*(?:>=|=>|>=\s*)?\s*([0-9]+\.[0-9]+)", text)
+    if pyver:
+        info["python_min_version"] = pyver.group(1)
+
+    # 入口点线索
+    entry_cmds = re.findall(r"(?mi)^(?:\s*[-*]\s*)?(?:Usage:|命令:)?\s*(\w[\w-]+)\b[^\n]*$", text)
+    if entry_cmds:
+        info["entry_points"] = list({c.strip() for c in entry_cmds})
+
+    # 链接提取
+    links = re.findall(r"\((https?://[^)]+)\)", text)
+    if links:
+        info["links"] = list({u for u in links})
+
+    return info
+
+
 # @dispInfo("observer")
 def observe(task: Task, current_index: int, last_result: StepResult | None) -> Tuple[bool, bool, str]:
     """

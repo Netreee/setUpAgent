@@ -82,5 +82,7 @@ class AgentState(TypedDict, total=False):
     mode: str  # "discover" | "execute"
     episode: int
     facts: dict
+    # 从 README 中提取的结构化信息
+    READMEinfo: dict
 
 

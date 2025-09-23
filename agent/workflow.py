@@ -60,6 +60,7 @@ def plan_node(state: AgentState) -> AgentState:
         "mode": state.get("mode", "discover"),
         "episode": int(state.get("episode", 1) or 1),
         "facts": dict(state.get("facts", {})),
+        "READMEinfo": dict(state.get("READMEinfo", {})),
     }
 
 
@@ -159,6 +160,22 @@ def observe_node(state: AgentState) -> AgentState:
     except Exception:
         pass
 
+    # 若上一步为读取 README 的输出，则尝试解析并合并到 READMEinfo
+    readmeinfo = dict(state.get("READMEinfo", {}))
+    try:
+        from agent.observer import extract_readme_info
+        if isinstance(last_result, dict):
+            cmd = str(last_result.get("command", ""))
+            out_text = str(last_result.get("stdout", ""))
+            if out_text and (
+                "README" in cmd.upper() or "README" in out_text[:50].upper()
+            ):
+                parsed = extract_readme_info(out_text)
+                if isinstance(parsed, dict) and parsed:
+                    readmeinfo.update(parsed)
+    except Exception:
+        pass
+
     # 索引推进策略（以 route 为准）
     next_idx = idx
     route = route_decision.get("route", "decide")
@@ -227,6 +244,7 @@ def observe_node(state: AgentState) -> AgentState:
         "mode": new_mode,
         "episode": new_episode,
         "facts": facts,
+        "READMEinfo": readmeinfo,
     }
     debug.note("route", result_state.get("route"))
     # 观察阶段摘要（单行）
