@@ -84,11 +84,22 @@ class PowerShellSession:
         # 尝试获取当前工作目录
         current_dir = "unknown"
         try:
-            _, pwd_output = await asyncio.wait_for(self._run("Get-Location | Select-Object -ExpandProperty Path"), timeout=5)
+            _, pwd_output = await asyncio.wait_for(self._run("Get-Location | Select-Object -ExpandProperty Path"), timeout=10)
             if pwd_output.strip():
                 current_dir = pwd_output.strip()
+            else:
+                # 无输出则重试一次
+                _, pwd_output2 = await asyncio.wait_for(self._run("Get-Location | Select-Object -ExpandProperty Path"), timeout=10)
+                if pwd_output2.strip():
+                    current_dir = pwd_output2.strip()
         except:
-            pass
+            try:
+                # 异常时重试一次
+                _, pwd_output2 = await asyncio.wait_for(self._run("Get-Location | Select-Object -ExpandProperty Path"), timeout=10)
+                if pwd_output2.strip():
+                    current_dir = pwd_output2.strip()
+            except:
+                pass
             
         return {
             "exit_code": exit_code,

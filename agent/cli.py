@@ -12,7 +12,7 @@ from agent.workflow import create_task_graph
 from agent.task_types import AgentState
 
 
-def run(goal: str):
+def run(goal: str, recursion_limit: int = 100):
     agent = create_task_graph()
 
     initial_state: AgentState = {
@@ -42,7 +42,7 @@ def run(goal: str):
             pass
         return {}
 
-    for event in agent.stream(initial_state):
+    for event in agent.stream(initial_state, config={"recursion_limit": recursion_limit}):
         for node_name, node_state in event.items():
             pass
         step += 1
@@ -51,8 +51,9 @@ def run(goal: str):
 def main():
     parser = argparse.ArgumentParser(description="独立任务执行器（线性计划→顺序执行→观察）")
     parser.add_argument("--goal", required=True, help="用户任务描述，例如：安装requirements中所有的依赖")
+    parser.add_argument("--recursion-limit", type=int, default=100, help="LangGraph 最大递归层数（默认100）")
     args = parser.parse_args()
-    run(args.goal)
+    run(args.goal, recursion_limit=args.recursion_limit)
 
 
 if __name__ == "__main__":

@@ -9,17 +9,20 @@ def _short(text: Optional[str], n: int = 600) -> str:
 
 
 # @dispInfo("decider")
-def summarize_context(task: Task, current_index: int, last_result: Optional[Dict[str, Any]]) -> str:
+def summarize_context(task: Task, current_index: int, last_result: Optional[Dict[str, Any]], *, mode: str = "", episode: int = 0, facts: Optional[Dict[str, Any]] = None) -> str:
     """汇总上下文（目标/计划/当前位置/上一次结果），用于喂给LLM。"""
     steps = task.get("steps", [])
     plan_titles = [s.get("title", f"步骤{i+1}") for i, s in enumerate(steps)]
     current_step = steps[current_index] if 0 <= current_index < len(steps) else None
 
+    import json as _json
     return (
         f"任务目标: {task.get('goal','')}\n"
         f"计划步骤（标题序列）: {plan_titles}\n"
         f"当前步骤索引: {current_index}\n"
         f"当前步骤详情: {current_step}\n"
+        f"当前模式: {mode} 周期: {episode}\n"
+        f"已知事实: {_json.dumps(facts or {}, ensure_ascii=False)[:1000]}\n"
         f"上一次结果: exit_code={last_result.get('exit_code') if last_result else None}, "
         f"command={last_result.get('command') if last_result else None}\n"
         f"STDOUT: {_short(last_result.get('stdout') if last_result else '')}\n"
@@ -28,16 +31,17 @@ def summarize_context(task: Task, current_index: int, last_result: Optional[Dict
 
 
 # @dispInfo("decider")
-def decide_next_action(task: Task, current_index: int, last_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def decide_next_action(task: Task, current_index: int, last_result: Optional[Dict[str, Any]], *, mode: str = "", episode: int = 0, facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     决策下一步操作：
     返回结构：{"action": "call_tool"|"replan", "nl_instruction": str?, "timeout": int?, "session_token": str?}
     """
-    context = summarize_context(task, current_index, last_result)
+    context = summarize_context(task, current_index, last_result, mode=mode, episode=episode, facts=facts)
 
     prompt = (
         "你是一个任务执行的指挥官，负责根据当前计划与最近一次执行结果，决定下一步操作。\n"
-        "环境：Windows + PowerShell；工作目录由系统管理；你只需要输出结构化决策。\n\n"
+        "环境：Windows + PowerShell；工作目录由系统管理；你只需要输出结构化决策。\n"
+        "注意：当模式为 discover 时，更倾向输出信息采集类指令；当模式为 execute 时，更倾向推进实现的指令。\n\n"
         f"{context}\n"
         "输出严格的JSON，不要多余文字：\n"
         '{"action": "call_tool"|"replan", "nl_instruction": "...", "timeout": 60, "session_token": "..."}。当需要重规划时可省略 nl_instruction。\n'

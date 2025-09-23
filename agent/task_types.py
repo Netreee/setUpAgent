@@ -78,5 +78,9 @@ class AgentState(TypedDict, total=False):
     route: str
     # 会话ID：用于持久 Shell 会话
     session_id: Optional[str]
+    # 多周期/多模式
+    mode: str  # "discover" | "execute"
+    episode: int
+    facts: dict
 
 

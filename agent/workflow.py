@@ -8,7 +8,7 @@ from agent.tools import (
     make_tool_call_message,
     extract_last_tool_result,
 )
-from agent.observer import observe
+from agent.observer import observe, observe_v2
 from agent.executor import decide_next_action
 from agent.debug import dispInfo, debug
 
@@ -26,7 +26,24 @@ def plan_node(state: AgentState) -> AgentState:
         messages = state.get("messages", [])
         goal = messages[-1]["content"] if messages else ""
 
-    task, plan_text, raw_plan = plan_with_llm(goal)
+    # 将 mode/episode/facts 作为上下文传递给 planner（增量重规划时也用）
+    context = {
+        "mode": state.get("mode", "discover"),
+        "episode": int(state.get("episode", 1) or 1),
+        "facts": dict(state.get("facts", {})),
+    }
+    # 如果已有任务，补充增量上下文
+    prev_task = state.get("task")
+    if isinstance(prev_task, dict):
+        steps = prev_task.get("steps", [])
+        idx = int(state.get("current_step_index", 0) or 0)
+        context.update({
+            "completed_steps": steps[: max(0, min(idx, len(steps)))],
+            "remaining_steps": steps[max(0, min(idx, len(steps))):],
+            "last_result": state.get("last_result", {}),
+        })
+
+    task, plan_text, raw_plan = plan_with_llm(goal, context=context)
     debug.note("plan_raw", raw_plan)
     debug.note("summary_plan", plan_text)
     return {
@@ -39,6 +56,10 @@ def plan_node(state: AgentState) -> AgentState:
         "is_complete": False,
         "failed": False,
         "observation": "已生成计划",
+        # 保留现有 mode/episode/facts，不重置
+        "mode": state.get("mode", "discover"),
+        "episode": int(state.get("episode", 1) or 1),
+        "facts": dict(state.get("facts", {})),
     }
 
 
@@ -54,7 +75,14 @@ def decide_node(state: AgentState) -> AgentState:
     idx = int(state.get("current_step_index", 0))
     last_result = state.get("last_result")
 
-    decision = decide_next_action(task, idx, last_result)
+    decision = decide_next_action(
+        task,
+        idx,
+        last_result,
+        mode=str(state.get("mode", "")),
+        episode=int(state.get("episode", 0) or 0),
+        facts=state.get("facts", {}),
+    )
     if decision.get("action") == "replan":
         # 请求重规划
         debug.note("route", "plan")
@@ -110,17 +138,45 @@ def observe_node(state: AgentState) -> AgentState:
         except Exception:
             pass
 
-    is_complete, failed, obs = observe(task, idx, last_result)
-    debug.note("observation", obs)
+    # 新的 LLM 路由与事实增量
+    route_decision = observe_v2(
+        task,
+        idx,
+        last_result,
+        mode=str(state.get("mode", "discover")),
+        episode=int(state.get("episode", 1) or 1),
+        facts=state.get("facts", {}),
+    )
+    debug.note("observation_decision", route_decision)
+    obs = str(route_decision.get("notes", "")).strip() or ""
 
-    # 成功推进索引（当有最新工具结果且成功时）
+    # 合并 facts
+    facts = dict(state.get("facts", {}))
+    try:
+        delta = route_decision.get("facts_delta") or {}
+        if isinstance(delta, dict):
+            facts.update(delta)
+    except Exception:
+        pass
+
+    # 索引推进策略（以 route 为准）
     next_idx = idx
-    if tool_result and int(tool_result.get("exit_code", -1)) == 0:
+    route = route_decision.get("route", "decide")
+    if route == "repeat_step":
+        next_idx = idx
+    elif route == "skip_step":
         next_idx = idx + 1
-
-    # 若成功推进且 next_idx 已达末尾，标记完成并终止
-    steps_len = len(task.get("steps", []))
-    completed_now = (not failed) and (next_idx >= steps_len)
+    elif route == "decide":
+        # 若工具成功且未要求 repeat/skip，则推进
+        if tool_result and int(tool_result.get("exit_code", -1)) == 0:
+            next_idx = idx + 1
+        else:
+            next_idx = idx
+    elif route in ("plan", "switch_mode"):
+        # 交由 plan 重新规划，索引按需要可保持
+        next_idx = idx
+    elif route == "end":
+        next_idx = idx
 
     # 如果工具返回了新的 session_token（会话被新建或重建），更新到状态
     new_token = None
@@ -130,17 +186,47 @@ def observe_node(state: AgentState) -> AgentState:
     except Exception:
         pass
 
+    # 结束判定以 route 决定
+    steps_len = len(task.get("steps", []))
+    is_complete = True if route == "end" else False
+    failed = False
+    # 切换模式时，提升 episode 并回到 plan
+    new_mode = state.get("mode", "discover")
+    new_episode = int(state.get("episode", 1) or 1)
+    replan_requested = False
+    next_route = "decide"
+    if route == "plan":
+        replan_requested = True
+        next_route = "plan"
+    elif route == "switch_mode":
+        m = route_decision.get("mode")
+        if m in ("discover", "execute"):
+            new_mode = m
+        new_episode = new_episode + 1
+        replan_requested = True
+        next_route = "plan"
+    elif route == "decide":
+        next_route = "decide"
+    elif route == "repeat_step":
+        next_route = "decide"
+    elif route == "skip_step":
+        next_route = "decide"
+    elif route == "end":
+        next_route = END
+
     result_state = {
         **state,
         "current_step_index": next_idx,
         "last_result": last_result,
-        "is_complete": True if completed_now else is_complete,
-        "failed": False if completed_now else failed,
+        "is_complete": is_complete,
+        "failed": failed,
         "observation": obs,
-        # 失败时请求重规划
-        "replan_requested": False if completed_now else bool(failed),
-        "route": "plan" if (failed and not completed_now) else (END if completed_now else "execute"),
+        "replan_requested": replan_requested,
+        "route": next_route,
         "session_id": new_token or state.get("session_id"),
+        "mode": new_mode,
+        "episode": new_episode,
+        "facts": facts,
     }
     debug.note("route", result_state.get("route"))
     # 观察阶段摘要（单行）
@@ -166,7 +252,7 @@ def create_task_graph():
     workflow.add_edge("plan", "decide")
     workflow.add_edge("decide", "execute")
     workflow.add_edge("execute", "observe")
-    # 根据观察路由决定流向：END / plan(重规划) / execute(继续)
+    # 根据观察路由决定流向：END / plan(重规划) / decide(继续)
     def _route(s: AgentState):
         if s.get("is_complete"):
             return END

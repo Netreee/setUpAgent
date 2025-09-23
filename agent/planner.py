@@ -8,32 +8,28 @@ from agent.debug import dispInfo, debug
 
 PLANNER_PROMPT_TEMPLATE = Template(
     """
-你是一个任务规划器。根据用户的任务描述，产出一个线性的步骤列表。要求：
+你是一个任务规划器。根据用户的任务与“当前周期模式”生成该周期的线性步骤。
 
 【输出格式】
 - 仅输出JSON，不要任何其他说明、解释或多余文字。
-- JSON结构必须严格遵循：{"title": "总体标题", "steps": [{"title": "步骤标题", "instruction": "具体指令"}, ...]}
+- JSON结构：{"title": "本周期标题", "steps": [{"title": "步骤标题", "instruction": "自然语言指令"}, ...]}
 
-【工作环境】
-- 当前工作目录：$agent_work_root
-- 操作系统：Windows
-- 默认Shell：PowerShell
-- 所有命令必须在Windows/PowerShell环境中可直接执行
+【环境与模式】
+- 工作目录：$agent_work_root
+- 操作系统：Windows；Shell：PowerShell；指令将被自动翻译为单条 PowerShell 命令
+- 当前模式：$mode  （discover|execute）
+- 周期序号：$episode
+- 已知事实 facts（供参考）：$facts_json
 
-【步骤要求】
-- 第一步必须是“环境发现/感知”，用于安全地收集事实（只读），例如：列出关键文件、检查是否存在 pyproject.toml/setup.py/requirements*.txt/Makefile、读取必要小文件内容，输出结构化信息供后续步骤决策使用。
-- 每个步骤必须能通过单条命令完成。
-- 指令应详细描述"做什么"，而不是"怎么做"（系统会自动转换为具体命令）。
-- 指令应考虑上下文和依赖关系。
-- 如果需要创建文件/目录，请明确路径（相对当前工作目录）。
-- 如果需要安装依赖，请指定具体包管理器（pip, conda等）。
+【步骤建议（软约束）】
+- discover：优先做只读与低风险操作以收集上下文（列目录、读取小文件片段、检测版本/配置、解析依赖元数据等）。
+- execute：基于已知事实推进目标（安装/构建/运行/验证等）。
+- 步骤为“做什么”的自然语言；每步对应单条命令；必要时明确相对路径。
 
-【重规划规则（增量）】
-- 若提供了上下文（已完成步骤/剩余步骤/失败信息），请进行“增量重规划”而非完整重写：
-  1) 保留已完成步骤不变；
-  2) 仅生成“剩余步骤”，可在开头插入必要的修补步骤（如环境准备/错误修复）；
-  3) 确保新的剩余步骤线性可执行，且每步可由单条命令完成；
-  4) 输出的 JSON 中 steps 字段仅表示“剩余步骤”。
+【增量重规划】
+- 若提供了上下文（已完成/剩余/最近结果），请进行“增量重规划”：
+  1) 保留已完成步骤；2) 仅生成“剩余步骤”（可在开头插入修补步骤）；
+  3) 保证线性可执行，每步单条命令；4) 输出 JSON 中 steps 代表“剩余步骤”。
 
 【上下文信息】
 - 是否提供上下文：$has_context
@@ -43,28 +39,19 @@ PLANNER_PROMPT_TEMPLATE = Template(
 - STDOUT: $last_stdout
 - STDERR: $last_stderr
 
-【指令示例】
-以下是良好的指令示例：
-
-正确示例：
-- "发现当前仓库的关键文件并输出JSON摘要"（只读：列出 pyproject.toml/setup.py/requirements*.txt/Makefile 等并读取少量必要内容）
+【示例（可借鉴表达方式）】
+- "发现当前仓库的关键文件并输出JSON摘要"
 - "在当前目录创建一个名为test.txt的空文件"
-- "安装项目为可编辑模式（pip install -e .）"
+- "安装项目为可编辑模式"
 - "安装requirements.txt中的所有Python依赖包"
 - "将当前目录下的所有.py文件复制到backup文件夹"
 - "使用pip安装requests和numpy包"
 - "创建一个名为output的文件夹，并在其中创建README.md文件"
 
-错误示例（避免这些）：
-- "运行命令：mkdir test" （不要包含具体命令语法）
-- "使用命令行工具" （过于模糊）
-- "完成这个复杂的多步骤任务" （没有具体可执行的指令）
-
-【任务要求】
-请为以下任务生成步骤计划：
+请为以下任务生成该周期步骤：
 任务：$goal
 
-请严格按照JSON格式输出，不要添加任何解释文字。
+仅输出JSON。
 """
 )
 
@@ -84,6 +71,9 @@ def plan_with_llm(goal: str, context: Optional[Dict[str, Any]] = None) -> Tuple[
     completed_steps: List[TaskStep] = []
     remaining_steps: List[TaskStep] = []
     last_result: Dict[str, Any] = {}
+    mode = (context or {}).get("mode", "discover")
+    episode = (context or {}).get("episode", 1)
+    facts = (context or {}).get("facts", {})
     if context:
         completed_steps = list(context.get("completed_steps", []))
         remaining_steps = list(context.get("remaining_steps", []))
@@ -93,9 +83,13 @@ def plan_with_llm(goal: str, context: Optional[Dict[str, Any]] = None) -> Tuple[
         return ", ".join([s.get("title", f"步骤{i+1}") for i, s in enumerate(steps)]) or "(空)"
 
     # 使用模板渲染动态内容
+    import json as _json
     user_prompt = PLANNER_PROMPT_TEMPLATE.safe_substitute(
         agent_work_root=config.agent_work_root,
         goal=goal,
+        mode=str(mode),
+        episode=str(episode),
+        facts_json=_json.dumps(facts, ensure_ascii=False)[:1500],
         has_context="是" if context else "否",
         completed_titles=_titles(completed_steps),
         remaining_titles=_titles(remaining_steps),

@@ -1,56 +1,85 @@
-from typing import Tuple
+from typing import Tuple, Dict, Any, Optional
 from agent.task_types import Task, StepResult
 from utils import llm_completion
 from agent.debug import dispInfo, debug
 
 
+def _short(text: Optional[str], n: int = 600) -> str:
+    return (text or "")[:n]
+
+
+def observe_v2(task: Task, current_index: int, last_result: Optional[StepResult], *, mode: str, episode: int, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """LLM 驱动的观察与路由，返回结构化决策。"""
+    steps = task.get("steps", [])
+    titles = [s.get("title", f"步骤{i+1}") for i, s in enumerate(steps)]
+    import json as _json
+    prompt = (
+        "你是观察者。基于结果、模式与事实，决定下一跳路由与可能的事实增量。\n"
+        f"模式: {mode} 周期: {episode}\n"
+        f"目标: {task.get('goal','')}\n"
+        f"计划步骤标题序列: {titles}\n"
+        f"当前索引: {current_index}\n"
+        f"最近一次结果: {_json.dumps(last_result or {}, ensure_ascii=False)[:1200]}\n"
+        f"已知事实: {_json.dumps(facts or {}, ensure_ascii=False)[:1200]}\n\n"
+        "路由集合: decide | repeat_step | skip_step | plan | switch_mode | end\n"
+        "如需切换模式，请给出新的模式 discover/execute。可选给出 facts_delta 与 insert_steps。\n\n"
+        "仅输出 JSON：{\n"
+        "  \"route\": \"decide|repeat_step|skip_step|plan|switch_mode|end\",\n"
+        "  \"mode\": \"discover|execute\" | null,\n"
+        "  \"facts_delta\": { } | null,\n"
+        "  \"notes\": \"一句话原因\",\n"
+        "  \"insert_steps\": [{\"title\":\"...\",\"instruction\":\"...\"}] | null\n"
+        "}"
+    )
+    debug.note("observer_prompt", prompt)
+    try:
+        resp = llm_completion(prompt, temperature=0.2, max_tokens=400).strip()
+    except Exception:
+        resp = "{}"
+    debug.note("observer_raw_resp", resp)
+
+    import json, re
+    data: Optional[Dict[str, Any]] = None
+    try:
+        data = json.loads(resp)
+    except Exception:
+        m = re.search(r"\{.*\}", resp, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                data = None
+    if not isinstance(data, dict):
+        data = {"route": "decide", "notes": "默认继续"}
+    return data
+
+
 # @dispInfo("observer")
 def observe(task: Task, current_index: int, last_result: StepResult | None) -> Tuple[bool, bool, str]:
     """
-    观察器：根据最后一次执行结果与当前位置，决定是否完成或失败。
-
-    返回：(is_complete, failed, observation)
-    - is_complete: 是否已完成（成功走到终点或中途失败都视为完成当前回合）
-    - failed: 是否失败
-    - observation: 文本描述
+    保留旧签名给工作流使用。推荐通过外层 workflow 注入 mode/episode/facts 并使用 observe_v2 的结果更新 state。
+    这里返回值仅做日志用，不做硬路由判定。
     """
     steps_len = len(task.get("steps", []))
-
     if steps_len == 0:
         return True, False, "没有可执行的步骤，视为完成"
-
     if last_result is None and current_index == 0:
         return False, False, "尚未开始执行"
-
-    # 失败：最近一次结果非0（引入LLM分析，给出纠错建议简述）
     if last_result is not None and last_result.get("exit_code", -1) != 0:
+        # 失败时给一句话建议
         try:
             prompt = (
-                "你是一个软件自动化执行的观察者。\n"
-                "请分析一次命令执行失败的原因，并给出简短的纠错建议（不超过140字）。\n"
-                f"任务目标: {task.get('goal','')}\n"
-                f"步骤ID: {last_result.get('step_id')} 当前索引: {current_index}\n"
-                f"命令: {last_result.get('command','')}\n"
-                f"退出码: {last_result.get('exit_code')}\n"
-                f"STDOUT: {last_result.get('stdout','')[:500]}\n"
-                f"STDERR: {last_result.get('stderr','')[:500]}\n"
-                "仅输出纠错建议一句话。"
+                "请用一句话概括失败的原因与修复方向。\n"
+                f"命令: {last_result.get('command','')} 退出码: {last_result.get('exit_code')}\n"
+                f"STDOUT: {_short(last_result.get('stdout'))}\n"
+                f"STDERR: {_short(last_result.get('stderr'))}"
             )
-            debug.note("observer_prompt", prompt)
-            suggestion = llm_completion(prompt, temperature=0.2, max_tokens=120).strip()
-            debug.note("observer_raw_resp", suggestion)
+            suggestion = llm_completion(prompt, temperature=0.2, max_tokens=80).strip()
         except Exception:
-            suggestion = "执行失败。建议检查命令语法、权限、路径或网络。"
-        sid = last_result.get("step_id") if isinstance(last_result, dict) else None
-        sid_text = str(sid) if sid is not None else f"索引{current_index}"
-        # 失败但不终止，以便进入重规划
-        return False, True, f"步骤 {sid_text} 失败：{suggestion}"
-
-    # 成功走到末尾
+            suggestion = "失败，建议检查命令、权限、路径或网络。"
+        return False, True, suggestion
     if current_index >= steps_len:
         return True, False, "所有步骤执行成功"
-
-    # 仍需继续（对齐推进语义，提示下一个将要执行的索引）
-    return False, False, f"已完成步骤索引 {current_index - 1 if current_index > 0 else -1}，将执行索引 {current_index}"
+    return False, False, f"将执行索引 {current_index}"
 
 
