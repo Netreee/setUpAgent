@@ -40,7 +40,9 @@ def decide_next_action(task: Task, current_index: int, last_result: Optional[Dic
 
     prompt = (
         "你是一个任务执行的指挥官，负责根据当前计划与最近一次执行结果，决定下一步操作。\n"
-        "环境：Windows + PowerShell；工作目录由系统管理；你只需要输出结构化决策。\n"
+        "环境：Windows + PowerShell；执行层会在仓库根(facts.repo_root)下固定执行命令；你只需要输出结构化决策。\n"
+        "强约束：不要包含 cd/Set-Location/Push-Location 等切换目录描述；不要给出具体命令行；不要写绝对磁盘路径。路径若需说明，请以“仓库根/项目根”为参照进行自然语言描述（例如：在项目根的 requirements.txt 上执行安装）。\n"
+        "路径参照规范：凡涉及路径，一律以 facts.repo_root 或 facts.project_root 为基准进行自然语言描述，不引用盘符路径。\n"
         "注意：当模式为 discover 时，更倾向输出信息采集类指令；当模式为 execute 时，更倾向推进实现的指令。\n\n"
         f"{context}\n"
         "输出严格的JSON，不要多余文字：\n"

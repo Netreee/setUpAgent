@@ -98,6 +98,23 @@ class DebugInfoManager:
             print(f"返回: {_safe_serialize(_redact(rec.return_value))}")
         print("-" * 60)
 
+    # 追加：将任意对象（如完整 state）以 JSON 形式写入日志文件
+    def write_json_log(self, payload: Any, file_path: Optional[str] = None) -> None:
+        try:
+            # 默认日志文件：.agent_state.log 放在当前工作目录
+            target = file_path or ".agent_state.log"
+            # 尽量保留原始对象，但要做脱敏与可序列化处理
+            redacted = _redact(payload)
+            text = json.dumps(redacted, ensure_ascii=False, default=str)
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            with open(target, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] ")
+                f.write(text)
+                f.write("\n")
+        except Exception:
+            # 不因日志失败影响主流程
+            pass
+
 
 def dispInfo(tag: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """
@@ -118,6 +135,24 @@ def dispInfo(tag: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
             except BaseException as e:
                 debug.end(None, e)
                 raise
+
+        # 兼容 async 函数：如果 func 是协程函数，则返回异步包装器
+        try:
+            import inspect
+            if inspect.iscoroutinefunction(func):
+                @wraps(func)
+                async def _async_wrapper(*args, **kwargs):
+                    debug.start(tag, func.__name__, args, kwargs)
+                    try:
+                        rv = await func(*args, **kwargs)
+                        debug.end(rv, None)
+                        return rv
+                    except BaseException as e:
+                        debug.end(None, e)
+                        raise
+                return _async_wrapper  # type: ignore[return-value]
+        except Exception:
+            pass
 
         return _sync_wrapper
 

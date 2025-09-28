@@ -39,6 +39,9 @@ PLANNER_PROMPT_TEMPLATE = Template(
 - STDOUT: $last_stdout
 - STDERR: $last_stderr
 
+【重要约束】
+以下步骤已经完成：$finished_titles_json，你无需在本次计划中重复这些步骤。
+
 【示例（可借鉴表达方式）】
 - "发现当前仓库的关键文件并输出JSON摘要"
 - "在当前目录创建一个名为test.txt的空文件"
@@ -47,6 +50,8 @@ PLANNER_PROMPT_TEMPLATE = Template(
 - "将当前目录下的所有.py文件复制到backup文件夹"
 - "使用pip安装requests和numpy包"
 - "创建一个名为output的文件夹，并在其中创建README.md文件"
+
+注意：模式切换由上游 observer 直接写入 state.mode，planner 仅按 state.mode 规划，不处理模式切换。
 
 请为以下任务生成该周期步骤：
 任务：$goal
@@ -74,6 +79,7 @@ def plan_with_llm(goal: str, context: Optional[Dict[str, Any]] = None) -> Tuple[
     mode = (context or {}).get("mode", "discover")
     episode = (context or {}).get("episode", 1)
     facts = (context or {}).get("facts", {})
+    finished_titles: List[str] = (context or {}).get("finished_titles", []) or []
     if context:
         completed_steps = list(context.get("completed_steps", []))
         remaining_steps = list(context.get("remaining_steps", []))
@@ -97,6 +103,7 @@ def plan_with_llm(goal: str, context: Optional[Dict[str, Any]] = None) -> Tuple[
         last_cmd=str(last_result.get("command", ""))[:200],
         last_stdout=str(last_result.get("stdout", ""))[:300],
         last_stderr=str(last_result.get("stderr", ""))[:300],
+        finished_titles_json=_json.dumps(finished_titles, ensure_ascii=False),
     )
 
     debug.note("planner_prompt", user_prompt)

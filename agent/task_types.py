@@ -84,5 +84,7 @@ class AgentState(TypedDict, total=False):
     facts: dict
     # 从 README 中提取的结构化信息
     READMEinfo: dict
+    # 由 observer 维护：已完成步骤的标题集合（用于 planner 提示防止重复）
+    finished_titles: list[str]
 
 

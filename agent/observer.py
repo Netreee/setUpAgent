@@ -13,6 +13,7 @@ def observe_v2(task: Task, current_index: int, last_result: Optional[StepResult]
     steps = task.get("steps", [])
     titles = [s.get("title", f"步骤{i+1}") for i, s in enumerate(steps)]
     import json as _json
+    import os as _os
     prompt = (
         "你是观察者。基于结果、模式与事实，决定下一跳路由与可能的事实增量。\n"
         f"模式: {mode} 周期: {episode}\n"
@@ -21,10 +22,13 @@ def observe_v2(task: Task, current_index: int, last_result: Optional[StepResult]
         f"当前索引: {current_index}\n"
         f"最近一次结果: {_json.dumps(last_result or {}, ensure_ascii=False)[:1200]}\n"
         f"已知事实: {_json.dumps(facts or {}, ensure_ascii=False)[:1200]}\n\n"
-        "路由集合: decide | repeat_step | skip_step | plan | switch_mode | end\n"
-        "如需切换模式，请给出新的模式 discover/execute。可选给出 facts_delta 与 insert_steps。\n\n"
+        "路由集合: decide | repeat_step | skip_step | plan | end\n"
+        "facts_delta 统一命名要求：仅使用 repo_root, project_root, project_name, exec_root 等标准键；不要输出 clone_path/repo_path/work_dir 等旧键。\n"
+        "若克隆完成，请提供 project_root 与 project_name；若已知 repo_root，请补充 exec_root = repo_root。\n"
+        "路径叙述一律以 repo_root/project_root 为参照，不使用绝对盘符路径。\n\n"
+        "如需切换模式，请直接在输出中提供 mode 字段（discover/execute）。可选给出 facts_delta 与 insert_steps。\n\n"
         "仅输出 JSON：{\n"
-        "  \"route\": \"decide|repeat_step|skip_step|plan|switch_mode|end\",\n"
+        "  \"route\": \"decide|repeat_step|skip_step|plan|end\",\n"
         "  \"mode\": \"discover|execute\" | null,\n"
         "  \"facts_delta\": { } | null,\n"
         "  \"notes\": \"一句话原因\",\n"
@@ -51,6 +55,40 @@ def observe_v2(task: Task, current_index: int, last_result: Optional[StepResult]
                 data = None
     if not isinstance(data, dict):
         data = {"route": "decide", "notes": "默认继续"}
+
+    # 统一并规范 facts_delta 字段（映射旧键、补齐标准键）
+    try:
+        fd = data.get("facts_delta")
+        if isinstance(fd, dict):
+            # clone_path -> project_root
+            if "clone_path" in fd and not fd.get("project_root"):
+                fd["project_root"] = fd.pop("clone_path")
+            # repo_path -> repo_root（向后兼容）
+            if "repo_path" in fd and not fd.get("repo_root"):
+                fd["repo_root"] = fd.pop("repo_path")
+            # 填充 project_name
+            pr = fd.get("project_root")
+            if isinstance(pr, str) and pr and not fd.get("project_name"):
+                fd["project_name"] = _os.path.basename(pr.rstrip("\\/")) or fd.get("project_name")
+            # 补齐 exec_root = repo_root
+            if not fd.get("exec_root"):
+                if fd.get("repo_root"):
+                    fd["exec_root"] = fd["repo_root"]
+                elif isinstance(facts, dict) and facts.get("repo_root"):
+                    fd["exec_root"] = facts.get("repo_root")
+            # 若仅有 repo_root 与 project_name，尝试推导 project_root（纯字符串拼接）
+            if not fd.get("project_root") and fd.get("repo_root") and fd.get("project_name"):
+                try:
+                    fd["project_root"] = _os.path.join(fd["repo_root"], fd["project_name"])  # 不访问文件系统
+                except Exception:
+                    pass
+            # 清理旧键
+            for legacy in ("work_dir",):
+                if legacy in fd:
+                    fd.pop(legacy, None)
+            data["facts_delta"] = fd
+    except Exception:
+        pass
     return data
 
 
