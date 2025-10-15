@@ -6,6 +6,14 @@
   python -m agent.cli --goal "安装requirements中所有的依赖"
 """
 
+import sys
+import os
+# 确保项目根目录在 Python 路径中（支持直接运行此脚本）
+if __name__ == "__main__":
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
 import argparse
 from typing import Dict, Any
 from agent.workflow import create_task_graph

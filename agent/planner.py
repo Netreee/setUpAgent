@@ -8,48 +8,128 @@ from agent.debug import dispInfo, debug
 
 PLANNER_PROMPT_TEMPLATE = Template(
     """
-你是一个任务规划器。根据用户的任务与“当前周期模式”生成该周期的线性步骤。
+你是一个严格的任务规划器。你的职责是基于“用户任务 + 当前周期模式 + 已知事实（facts）”生成本周期可直接执行的线性步骤。
 
-【输出格式】
-- 仅输出JSON，不要任何其他说明、解释或多余文字。
-- JSON结构：{"title": "本周期标题", "steps": [{"title": "步骤标题", "instruction": "自然语言指令"}, ...]}
+【仅输出】
+- 仅输出 JSON，不得包含解释性文字、Markdown、代码块标记或多余内容。
+
+【输出Schema】
+{
+  "title": "本周期标题",
+  "environment_selection": {
+    "installer": "uv|pip|poetry|pdm|conda|pipenv|custom|none",
+    "reason": "为何选择该安装/运行通道的简要理由（必须引用事实）",
+    "evidence_fact_keys": ["facts中用到的关键键路径，如 files.pyproject.exists" ]
+  },
+  "steps": [ { "title": "步骤标题", "instruction": "单条可执行命令或自然语言指令" } , ... ],
+  "self_check": { "ok": true, "violations": ["若发现与约束/事实冲突，逐条描述；若无冲突则为空数组"] }
+}
+
+【硬性约束（必须遵守）】
+- facts 具有最高优先级：不得生成与 facts 明确冲突的工具、文件或路径（例如 facts 指示 X 文件不存在，就不得引用它）。
+- 当 facts 中已经存在关键路径或状态时，必须据此裁剪步骤：
+  * 若 facts.project_root 已存在：禁止输出任何“克隆仓库”类步骤；应直接在该目录继续后续步骤。
+  * 若 facts.has_pyproject=true（或 has_setup_py/has_requirements_txt=true）：禁止重复探测是否存在，应直接使用这些文件的信息做决策。
+  * 若 facts.readme_read=true：除非需要补充信息，避免再次读取 README。
+- 每个步骤的 instruction 字段必须是**纯意图描述**，严禁包含：
+  * PowerShell 命令（如 Get-ChildItem、Test-Path）
+  * 工具名或半格式化调用（如 files_list:、pyenv_python_info:）
+  * 只描述"要完成什么"，不描述"如何完成"（决策层会自动选择工具或生成命令）
+- 工作目录：$agent_work_root；操作系统：Windows；Shell：PowerShell。
+- 输出中不得重复已完成步骤：以下步骤已经完成：$finished_titles_json。
+
+【instruction 字段规范】
+正确示例（纯意图描述）：
+  ✓ "列出 setupLab2 目录下的所有文件和文件夹"
+  ✓ "检查 transformers 目录是否存在"
+  ✓ "读取 transformers/pyproject.toml 文件的内容"
+  ✓ "克隆 huggingface/transformers 仓库到工作目录"
+  ✓ "使用 pip 在项目根目录安装可编辑模式的包"
+  
+错误示例（包含命令或工具名）：
+  ✗ "Get-ChildItem -Path D:\\setupLab2"           ← 不要输出具体命令
+  ✗ "files_list: transformers"                    ← 不要输出工具名
+  ✗ "Test-Path D:\\setupLab2\\transformers"      ← 不要输出 PowerShell 命令
+  ✗ "pip install -e ."                            ← 不要输出命令，应描述意图
 
 【环境与模式】
-- 工作目录：$agent_work_root
-- 操作系统：Windows；Shell：PowerShell；指令将被自动翻译为单条 PowerShell 命令
 - 当前模式：$mode  （discover|execute）
 - 周期序号：$episode
-- 已知事实 facts（供参考）：$facts_json
+- 已知事实 facts（必须遵守）：$facts_json
 
-【步骤建议（软约束）】
-- discover：优先做只读与低风险操作以收集上下文（列目录、读取小文件片段、检测版本/配置、解析依赖元数据等）。在发现阶段若仓库存在 README（README.md/README.MD/Readme.md/README），请优先加入“阅读 README 全文并输出原文”的一步，以便后续解析结构化信息。
-- execute：基于已知事实推进目标（安装/构建/运行/验证等）。
-- 步骤为“做什么”的自然语言；每步对应单条命令；必要时明确相对路径。
+【步骤与选择指南（优先专用工具，run_instruction 仅兜底）】
+- discover 模式：生成探测意图（列目录、检查文件是否存在、读取文件内容、解析配置等）
+  * 示例："列出 repo_root 下的所有文件"、"检查 pyproject.toml 是否存在"
+- execute 模式：生成执行意图（安装依赖、运行脚本、构建项目等）
+  * 示例："使用 pip 安装所有依赖"、"运行项目的测试套件"
+- 先做"环境选择"：在 environment_selection 中给出 installer 的枚举值，并用 evidence_fact_keys 指明你依据了哪些 facts；reason 需简要引用这些 facts。
+- 所有步骤都用意图描述，决策层会根据意图自动选择：
+  * 专用工具（files_*/pyenv_*）：用于文件系统探测和 Python 环境分析
+  * Git 相关操作优先使用结构化 Git 工具（由决策层映射）：
+    - git_repo_status：检查/确认仓库状态（是否为仓库、origin、分支）
+    - git_ensure_cloned：确保仓库已在工作区内可用（若不存在则浅克隆，避免重复克隆）
+  * 通用执行（run_instruction）：仅用于无法由专用工具完成的命令，避免直接使用 shell 级 git clone
+- 禁止描述目录切换操作，需要操作不同目录时直接在意图中说明目标路径（引用 facts 中的路径键）。
+- 若 facts 不足以直接做出选择，应在 discover 中先安排最少量的"存在性探测"步骤，然后再进行安装/运行步骤。
+
+【Git 操作策略】
+- instruction 中不得出现任何 git 命令；保持纯“意图描述”。
+- 与仓库相关的意图（如“确认仓库是否存在并可用”“确保仓库在工作目录可用”），由决策层优先映射到 git_repo_status / git_ensure_cloned 工具，而非 shell。
+- execute 模式下若 facts.project_root 已存在：禁止产出“克隆”类意图。必要时可产出“检查仓库状态”的意图（决策层→git_repo_status）。
+- 示例：
+  * "确认仓库是否已存在并可用" → 决策层会使用 git_repo_status
+  * "确保仓库已在工作目录可用（若不存在则克隆）" → 决策层会使用 git_ensure_cloned
+
+【execute 模式严格约束与推理过程】
+当 $mode == "execute" 时，必须遵守以下规则：
+1. **禁止探测性步骤**：不得生成任何探测性步骤（如 files_exists, files_list, files_find）
+2. **禁止重复克隆**：若 facts 中已有 project_root，说明仓库已克隆完成，禁止生成 git clone 步骤
+3. **基于facts生成步骤**：每个步骤必须引用 facts 中已确认存在的文件/目录/工具
+4. **推理过程示例**：
+   ```
+   检查facts: {"project_root": "D:\\work\\repo", "has_pyproject": true}
+   推理: 仓库已存在，有pyproject.toml，可直接安装
+   生成步骤: "在 project_root 目录下使用 pip 安装可编辑模式的包"
+   ```
+5. **Facts不足处理**：若 facts 不足以支撑任何 execute 步骤，应在 self_check.violations 中说明并返回空 steps 数组
+
+【Facts应用检查清单】
+在生成每个步骤前，必须检查：
+- ✓ 是否需要project_root？检查facts中是否存在
+- ✓ 是否需要特定文件？检查facts中对应的has_xxx字段
+- ✓ 是否与已有facts冲突？如facts显示文件不存在但步骤要使用该文件
+- ✓ 是否忽略了关键facts？如project_root存在但仍要git clone
+
+【discover 模式约束与推理（严格利用 facts，减少无效探测）】
+1. **意图描述**：所有步骤用意图描述（不要输出命令），决策层会自动选择工具
+2. **避免重复**：严格检查 $finished_titles_json，不得重复已完成的步骤
+3. **Facts应用推理**：
+   ```
+   检查facts: {"project_root": "D:\\work\\repo"}
+   推理: 仓库已存在，无需克隆，直接探测内部结构
+   生成步骤: "列出 project_root 目录下的所有文件和文件夹"
+   ```
+4. **智能跳过已知信息**：
+   - 若facts中已有project_root，跳过git clone步骤
+   - 若facts中已有has_pyproject=true，跳过检查pyproject.toml是否存在
+   - 若facts中已有readme_read=true，跳过读取README步骤
+5. **意图描述示例**：
+   - "列出 X 目录的文件" → 决策层会选择 files_list 工具
+   - "检查 X 文件是否存在" → 决策层会选择 files_exists 工具
+   - "读取 X 文件的内容" → 决策层会选择 files_read 工具
 
 【增量重规划】
-- 若提供了上下文（已完成/剩余/最近结果），请进行“增量重规划”：
-  1) 保留已完成步骤；2) 仅生成“剩余步骤”（可在开头插入修补步骤）；
+- 若提供了上下文（已完成/剩余/最近结果），请“只生成剩余步骤”：
+  1) 保留已完成步骤；2) 仅输出“剩余步骤”（可在开头插入必要的修补步骤）；
   3) 保证线性可执行，每步单条命令；4) 输出 JSON 中 steps 代表“剩余步骤”。
 
-【上下文信息】
-- 是否提供上下文：$has_context
-- 已完成步骤（标题序列）：$completed_titles
-- 既有剩余步骤（标题序列）：$remaining_titles
-- 最近一次失败/结果摘要：exit_code=$last_exit, cmd=$last_cmd
-- STDOUT: $last_stdout
-- STDERR: $last_stderr
-
-【重要约束】
-以下步骤已经完成：$finished_titles_json，你无需在本次计划中重复这些步骤。
-
-【示例（可借鉴表达方式）】
-- "发现当前仓库的关键文件并输出JSON摘要"
-- "在当前目录创建一个名为test.txt的空文件"
-- "安装项目为可编辑模式"
-- "安装requirements.txt中的所有Python依赖包"
-- "将当前目录下的所有.py文件复制到backup文件夹"
-- "使用pip安装requests和numpy包"
-- "创建一个名为output的文件夹，并在其中创建README.md文件"
+【一致性自检】
+- 在输出前进行自我检查：逐条核对"硬性约束"与 facts；如有冲突，先在你这一步完成修正后再输出；self_check.ok 必须为 true。
+- **Facts一致性验证**：
+  1. 检查每个步骤是否与facts冲突（如facts显示文件不存在，但步骤要读取该文件）
+  2. 检查是否忽略了关键facts（如project_root存在但仍要git clone）
+  3. 检查是否充分利用了facts（如has_pyproject=true但选择了错误的安装器）
+  4. 如发现问题，必须在violations中详细说明并修正步骤
 
 注意：模式切换由上游 observer 直接写入 state.mode，planner 仅按 state.mode 规划，不处理模式切换。
 
@@ -95,7 +175,7 @@ def plan_with_llm(goal: str, context: Optional[Dict[str, Any]] = None) -> Tuple[
         goal=goal,
         mode=str(mode),
         episode=str(episode),
-        facts_json=_json.dumps(facts, ensure_ascii=False)[:1500],
+        facts_json=_json.dumps(facts, ensure_ascii=False)[:4000],
         has_context="是" if context else "否",
         completed_titles=_titles(completed_steps),
         remaining_titles=_titles(remaining_steps),
@@ -106,7 +186,7 @@ def plan_with_llm(goal: str, context: Optional[Dict[str, Any]] = None) -> Tuple[
         finished_titles_json=_json.dumps(finished_titles, ensure_ascii=False),
     )
 
-    debug.note("planner_prompt", user_prompt)
+    # debug.note("planner_prompt", user_prompt)  # 提示词太长，不记录
     resp = llm_completion(user_prompt, temperature=0.1, max_tokens=1000)
     debug.note("planner_raw_resp", resp)
 

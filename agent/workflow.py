@@ -3,13 +3,28 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from agent.task_types import AgentState
 from agent.planner import plan_with_llm
-from agent.tools import (
-    RUN_INSTRUCTION_TOOL,
+from agent.message_utils import (
     make_tool_call_message,
+    make_generic_tool_call_message,
     extract_last_tool_result,
+)
+from tools import (
+    RUN_INSTRUCTION_TOOL,
+    FILES_EXISTS_TOOL,
+    FILES_STAT_TOOL,
+    FILES_LIST_TOOL,
+    FILES_READ_TOOL,
+    FILES_FIND_TOOL,
+    PYENV_PYTHON_INFO_TOOL,
+    PYENV_TOOL_VERSIONS_TOOL,
+    PYENV_PARSE_PYPROJECT_TOOL,
+    PYENV_SELECT_INSTALLER_TOOL,
+    GIT_REPO_STATUS_TOOL,
+    GIT_ENSURE_CLONED_TOOL,
 )
 from agent.observer import observe, observe_v2
 import os
+import re
 from agent.executor import decide_next_action
 from config import get_config
 from agent.debug import dispInfo, debug
@@ -29,15 +44,27 @@ def plan_node(state: AgentState) -> AgentState:
         goal = messages[-1]["content"] if messages else ""
 
     # 将 mode/episode/facts/finished_titles 作为上下文传递给 planner（增量重规划时也用）
+    curr_mode = state.get("mode", "discover")
     context = {
-        "mode": state.get("mode", "discover"),
+        "mode": curr_mode,
         "episode": int(state.get("episode", 1) or 1),
         "facts": dict(state.get("facts", {})),
         "finished_titles": list(state.get("finished_titles", [])),
     }
-    # 如果已有任务，补充增量上下文
+    
+    # 检测模式切换：若从上一个任务的隐式模式切换到当前模式，需要完全重规划
     prev_task = state.get("task")
+    mode_switched = False
     if isinstance(prev_task, dict):
+        # 从 finished_titles 推断上一个任务的模式（简单启发式）
+        prev_mode = state.get("_last_plan_mode", "discover")  # 保存上次规划时的模式
+        if prev_mode != curr_mode:
+            mode_switched = True
+            debug.note("mode_switch_detected", f"{prev_mode} -> {curr_mode}")
+    
+    # 如果已有任务，补充增量上下文
+    if isinstance(prev_task, dict) and not mode_switched:
+        # 增量重规划：保留已完成步骤
         steps = prev_task.get("steps", [])
         idx = int(state.get("current_step_index", 0) or 0)
         context.update({
@@ -45,27 +72,43 @@ def plan_node(state: AgentState) -> AgentState:
             "remaining_steps": steps[max(0, min(idx, len(steps))):],
             "last_result": state.get("last_result", {}),
         })
+    else:
+        # 模式切换或首次规划：完全重规划（不保留已完成步骤）
+        context.update({
+            "completed_steps": [],
+            "remaining_steps": [],
+            "last_result": state.get("last_result", {}),
+        })
 
     task, plan_text, raw_plan = plan_with_llm(goal, context=context)
     debug.note("plan_raw", raw_plan)
     debug.note("summary_plan", plan_text)
+    
+    # 如果是模式切换后的完全重规划，重置步骤索引到 0
+    next_idx = 0 if mode_switched else int(state.get("current_step_index", 0) or 0)
+    
     return {
         **state,
         "task": task,
         "plan_text": plan_text,
         "plan_raw": raw_plan,
-        # 保持当前索引，避免回到0
-        "current_step_index": int(state.get("current_step_index", 0) or 0),
+        # 保持当前索引，避免回到0（除非模式切换）
+        "current_step_index": next_idx,
         "last_result": None,
         "is_complete": False,
         "failed": False,
-        "observation": "已生成计划",
+        "observation": "已生成计划" + (" (模式切换)" if mode_switched else ""),
         # 保留现有 mode/episode/facts，不重置
-        "mode": state.get("mode", "discover"),
+        "mode": curr_mode,
         "episode": int(state.get("episode", 1) or 1),
         "facts": dict(state.get("facts", {})),
         "READMEinfo": dict(state.get("READMEinfo", {})),
+        # 清理重规划标志，避免无限循环
+        "replan_requested": False,
+        "route": None,
         "finished_titles": list(state.get("finished_titles", [])),
+        # 保存本次规划时的模式，用于下次检测模式切换
+        "_last_plan_mode": curr_mode,
     }
 
 
@@ -99,10 +142,9 @@ def decide_node(state: AgentState) -> AgentState:
             "decide_raw": decision.get("raw", ""),
         }
 
-    # 默认或明确 call_tool：生成工具调用消息（使用持久会话）
-    nl_instruction = str(decision.get("nl_instruction", "")).strip()
+    # 根据决策生成调用消息（支持 call_tool/call_instruction）
+    action = decision.get("action")
     timeout = int(decision.get("timeout", 60) or 60)
-    # 决策可直接给出 token，否则沿用 state 上保存的
     session_token = decision.get("session_token") or state.get("session_id")
 
     # 在调用工具前，将 REPO_ROOT/PROJECT_ROOT 注入到当前进程环境，供执行层使用
@@ -118,11 +160,59 @@ def decide_node(state: AgentState) -> AgentState:
         pass
 
     messages = list(state.get("messages", []))
-    messages.append(make_tool_call_message(nl_instruction, timeout, session_token))
-    debug.note("tool_in_nl_instruction", nl_instruction)
-    debug.note("tool_in_timeout", timeout)
+
+    # 反克隆保护与替换：将任何即将执行的 "git clone" 转换为结构化 git 工具
+    try:
+        facts_env = state.get("facts", {}) or {}
+        planned_nl = str(decision.get("nl_instruction", "") or "")
+        is_clone_instruction = isinstance(planned_nl, str) and re.search(r"\bgit\s+clone\b", planned_nl, re.IGNORECASE)
+        if action == "call_instruction" and is_clone_instruction:
+            # 若已存在 project_root，则改为查询仓库状态，避免重复克隆
+            proj = facts_env.get("project_root") or ""
+            if isinstance(proj, str) and proj:
+                try:
+                    if os.path.exists(proj):
+                        messages.append(make_generic_tool_call_message("git_repo_status", {"path": proj}))
+                        debug.note("clone_guard", f"project_root exists, redirect to git_repo_status: {proj}")
+                        debug.note("route", "execute")
+                        return {**state, "messages": messages, "decide_raw": decision.get("raw", "")}
+                except Exception:
+                    pass
+            # 未存在则尝试解析 URL/目标目录，调用 git_ensure_cloned
+            m = re.search(r"\bgit\s+clone\s+(\S+)(?:\s+(\S+))?", planned_nl, re.IGNORECASE)
+            url = m.group(1) if m else ""
+            dest_arg = m.group(2) if m else None
+            args = {"url": url}
+            if isinstance(dest_arg, str) and dest_arg and not dest_arg.startswith("$"):
+                # 清理不合法的目标：dest='.' 等同未提供，避免将工作区根当作仓库目录
+                clean_dest = dest_arg.strip().strip('"').strip("'")
+                if clean_dest not in ("", ".", "./"):
+                    args["dest"] = clean_dest
+            elif isinstance(proj, str) and proj:
+                # 使用事实中的 project_root 作为目标
+                args["dest"] = proj
+            args["depth"] = 1
+            args["sparse"] = True
+            messages.append(make_generic_tool_call_message("git_ensure_cloned", args))
+            debug.note("clone_rewrite", {"from": planned_nl, "to": args})
+            debug.note("route", "execute")
+            return {**state, "messages": messages, "decide_raw": decision.get("raw", "")}
+    except Exception:
+        pass
+
+    if action == "call_tool":
+        tool_name = str(decision.get("tool_name", "")).strip()
+        tool_args = decision.get("tool_args") or {}
+        messages.append(make_generic_tool_call_message(tool_name, tool_args))
+        debug.note("tool_in_name", tool_name)
+        debug.note("tool_in_args", tool_args)
+    else:
+        nl_instruction = str(decision.get("nl_instruction", "")).strip()
+        messages.append(make_tool_call_message(nl_instruction, timeout, session_token))
+        debug.note("tool_in_nl_instruction", nl_instruction)
+        debug.note("tool_in_timeout", timeout)
     debug.note("route", "execute")
-    return {**state, "messages": messages, "route": "execute", "decide_raw": decision.get("raw", "")}
+    return {**state, "messages": messages, "decide_raw": decision.get("raw", "")}
 
 
 @dispInfo("workflow")
@@ -280,21 +370,44 @@ def observe_node(state: AgentState) -> AgentState:
 
     # 索引推进策略（以 route 为准）
     next_idx = idx
-    route = route_decision.get("route", "decide")
-    if route == "repeat_step":
+    observer_route = route_decision.get("route", "decide")  # 保存原始路由
+    
+    if observer_route == "repeat_step":
         next_idx = idx
-    elif route == "skip_step":
+    elif observer_route == "skip_step":
         next_idx = idx + 1
-    elif route == "decide":
-        # 若工具成功且未要求 repeat/skip，则推进
-        if tool_result and int(tool_result.get("exit_code", -1)) == 0:
+    elif observer_route == "decide":
+        # 若观察器未要求 repeat/skip，则依据观察器显式 success 或工具类 ok(true) 决定是否推进
+        is_success = False
+        try:
+            # 优先采用 LLM 观察结果中的 success 信号
+            if route_decision.get("success") is True:
+                is_success = True
+            elif route_decision.get("success") is False:
+                is_success = False
+            else:
+                # 兜底：仅对非 shell 的只读工具（如 files/pyenv）使用 ok=true 判定
+                if isinstance(tool_result, dict) and tool_result.get("ok") is True:
+                    is_success = True
+        except Exception:
+            is_success = False
+
+        if is_success:
             next_idx = idx + 1
+            try:
+                debug.note("step_advanced", f"{idx} → {next_idx}")
+            except Exception:
+                pass
         else:
             next_idx = idx
-    elif route == "plan":
+            try:
+                debug.note("step_not_advanced", f"未得到 success 判定，保持在 {idx}")
+            except Exception:
+                pass
+    elif observer_route == "plan":
         # 交由 plan 重新规划，索引按需要可保持
         next_idx = idx
-    elif route == "end":
+    elif observer_route == "end":
         next_idx = idx
 
     # 如果工具返回了新的 session_token（会话被新建或重建），更新到状态
@@ -305,38 +418,90 @@ def observe_node(state: AgentState) -> AgentState:
     except Exception:
         pass
 
-    # 结束判定以 route 决定
+    # 结束判定完全由 Observer 决定
     steps_len = len(task.get("steps", []))
-    is_complete = True if route == "end" else False
+    is_complete = False
     failed = False
-    # 模式切换：observer 可在任何路由返回中附带 mode 建议
+    
+    # 只有 Observer 明确返回 "end" 才结束任务
+    if observer_route == "end":
+        is_complete = True
+        try:
+            debug.note("task_completed", f"Observer 决定结束任务")
+        except Exception:
+            pass
+    # 初始化路由状态
     new_mode = state.get("mode", "discover")
     new_episode = int(state.get("episode", 1) or 1)
     replan_requested = False
     next_route = "decide"
-    if route == "plan":
-        replan_requested = True
-        next_route = "plan"
-    elif route == "decide":
-        next_route = "decide"
-    elif route == "repeat_step":
-        next_route = "decide"
-    elif route == "skip_step":
-        next_route = "decide"
-    elif route == "end":
-        next_route = END
-
-    # 应用任意路由下的 mode 更新建议（若有变化则自增 episode 并触发重规划，除非已结束）
+    
+    # 优先级 1：检查模式切换（discover ↔ execute）
+    # 模式切换会触发重规划，优先级最高
     try:
         suggested_mode = route_decision.get("mode")
         if suggested_mode in ("discover", "execute") and suggested_mode != new_mode:
-            new_mode = suggested_mode
-            new_episode = new_episode + 1
-            if next_route != END:
+            # 防止频繁重规划：同一 episode 内只允许模式切换触发一次重规划
+            last_replan_episode = state.get("_last_replan_episode", 0)
+            if new_episode != last_replan_episode:
+                new_mode = suggested_mode
+                new_episode = new_episode + 1
                 replan_requested = True
                 next_route = "plan"
+                try:
+                    debug.note("mode_switch_triggered", f"{state.get('mode', 'discover')} -> {suggested_mode}, episode {new_episode}")
+                except Exception:
+                    pass
+            else:
+                try:
+                    debug.note("mode_switch_throttled", f"同一 episode 内已触发过模式切换，忽略本次建议")
+                except Exception:
+                    pass
     except Exception:
         pass
+    
+    # 优先级 2：处理 Observer 的路由决策
+    # 只有在没有触发模式切换的情况下才处理路由
+    if not replan_requested:
+        if is_complete:
+            # 任务完成，结束工作流
+            next_route = END
+        elif observer_route == "plan":
+            replan_requested = True
+            next_route = "plan"
+        elif observer_route == "decide":
+            next_route = "decide"
+        elif observer_route == "repeat_step":
+            next_route = "decide"
+        elif observer_route == "skip_step":
+            next_route = "decide"
+        elif observer_route == "end":
+            next_route = END
+
+    # 在返回前对 facts 进行规范化（绝对路径、占位符展开）
+    try:
+        from utils import normalize_facts
+        facts = normalize_facts(facts)
+    except Exception:
+        pass
+
+    # 简单的重复上限：当观察器建议 repeat_step 多于 2 次时，转为 plan
+    try:
+        repeat_counts = dict(state.get("repeat_counts", {}))
+        key = str(task.get("steps", [])[idx].get("title", idx)) if 0 <= idx < len(task.get("steps", [])) else str(idx)
+        if observer_route == "repeat_step":
+            repeat_counts[key] = int(repeat_counts.get(key, 0)) + 1
+            debug.note("repeat_count", f"步骤 {idx} 重复次数: {repeat_counts[key]}")
+            if repeat_counts[key] > 2:
+                # 重复太多次，触发重规划
+                replan_requested = True
+                next_route = "plan"
+                debug.note("repeat_limit_exceeded", f"步骤 {idx} 重复超过 2 次，触发重规划")
+        else:
+            # 非重复则重置计数
+            repeat_counts[key] = 0
+    except Exception:
+        repeat_counts = state.get("repeat_counts", {})
 
     result_state = {
         **state,
@@ -352,6 +517,9 @@ def observe_node(state: AgentState) -> AgentState:
         "episode": new_episode,
         "facts": facts,
         "READMEinfo": readmeinfo,
+        "repeat_counts": repeat_counts,
+        # 记录本次重规划的 episode，用于防止频繁重规划
+        "_last_replan_episode": new_episode if replan_requested else state.get("_last_replan_episode", 0),
     }
     debug.note("route", result_state.get("route"))
     # 观察阶段摘要（单行）
@@ -369,21 +537,47 @@ def observe_node(state: AgentState) -> AgentState:
 
 
 def create_task_graph():
-    """构建任务执行 LangGraph 工作流（plan → execute → observe → (END|plan)）。"""
+    """构建任务执行 LangGraph 工作流（plan → decide → execute → observe → (END|plan|decide)）。"""
     workflow = StateGraph(AgentState)
     workflow.add_node("plan", plan_node)
     # 决策节点：决定下一步调用的工具或是否重规划
     workflow.add_node("decide", decide_node)
-    # ToolNode: 将 run_single_sync 暴露为工具
-    workflow.add_node("execute", ToolNode([RUN_INSTRUCTION_TOOL]))
+    # ToolNode: 暴露执行与文件系统只读工具
+    workflow.add_node("execute", ToolNode([
+        RUN_INSTRUCTION_TOOL,
+        FILES_EXISTS_TOOL,
+        FILES_STAT_TOOL,
+        FILES_LIST_TOOL,
+        FILES_READ_TOOL,
+        FILES_FIND_TOOL,
+        PYENV_PYTHON_INFO_TOOL,
+        PYENV_TOOL_VERSIONS_TOOL,
+        PYENV_PARSE_PYPROJECT_TOOL,
+        PYENV_SELECT_INSTALLER_TOOL,
+        GIT_REPO_STATUS_TOOL,
+        GIT_ENSURE_CLONED_TOOL,
+    ]))
     workflow.add_node("observe", observe_node)
 
     workflow.set_entry_point("plan")
     workflow.add_edge("plan", "decide")
-    workflow.add_edge("decide", "execute")
+    
+    # decide节点的条件路由：根据决策结果决定是执行工具还是重规划
+    def _decide_route(s: AgentState):
+        if s.get("replan_requested") or s.get("route") == "plan":
+            return "plan"
+        return "execute"
+    
+    workflow.add_conditional_edges(
+        "decide",
+        _decide_route,
+        {"plan": "plan", "execute": "execute"},
+    )
+    
     workflow.add_edge("execute", "observe")
+    
     # 根据观察路由决定流向：END / plan(重规划) / decide(继续)
-    def _route(s: AgentState):
+    def _observe_route(s: AgentState):
         if s.get("is_complete"):
             return END
         route = s.get("route")
@@ -394,10 +588,9 @@ def create_task_graph():
 
     workflow.add_conditional_edges(
         "observe",
-        _route,
+        _observe_route,
         {END: END, "plan": "plan", "decide": "decide"},
     )
 
     return workflow.compile()
-
 

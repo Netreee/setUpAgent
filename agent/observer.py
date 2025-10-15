@@ -14,28 +14,117 @@ def observe_v2(task: Task, current_index: int, last_result: Optional[StepResult]
     titles = [s.get("title", f"步骤{i+1}") for i, s in enumerate(steps)]
     import json as _json
     import os as _os
+    
+    # 使用统一工具接口解析结果
+    from tools.base import parse_tool_response
+    
+    try:
+        _lr = dict(last_result or {})
+    except Exception:
+        _lr = {}
+    
+    # 解析工具返回
+    parsed = parse_tool_response(_json.dumps(_lr))
+    tool_name = parsed.get("tool", "unknown")
+    tool_ok = parsed.get("ok", False)
+    tool_data = parsed.get("data", {})
+    tool_error = parsed.get("error")
+    
+    # 构造关键数据摘要（仅显示重要字段）
+    key_fields = [
+        "path", "exists", "content", "exit_code", "command", "installer", "reason",
+        # git/files 关键字段补充
+        "existed", "cloned", "project_root", "project_name", "repo_root",
+        "remote_url", "branch", "is_repo", "dir", "entries", "truncated"
+    ]
+    data_summary = {k: v for k, v in tool_data.items() if k in key_fields}
+    data_summary_str = _json.dumps(data_summary, ensure_ascii=False)[:300]
+    
+    # 提取 stdout/stderr（如果是 run_instruction）
+    _stdout_full = str(tool_data.get("stdout", ""))
+    _stderr_full = str(tool_data.get("stderr", ""))
+    _stdout_len = len(_stdout_full)
+    _stderr_len = len(_stderr_full)
+    _slice = 600
+    _stdout_head = _stdout_full[:_slice]
+    _stdout_tail = _stdout_full[-_slice:] if _stdout_len > _slice else ""
+    _stderr_head = _stderr_full[:_slice]
+    _stderr_tail = _stderr_full[-_slice:] if _stderr_len > _slice else ""
+
     prompt = (
         "你是观察者。基于结果、模式与事实，决定下一跳路由与可能的事实增量。\n"
         f"模式: {mode} 周期: {episode}\n"
         f"目标: {task.get('goal','')}\n"
         f"计划步骤标题序列: {titles}\n"
         f"当前索引: {current_index}\n"
-        f"最近一次结果: {_json.dumps(last_result or {}, ensure_ascii=False)[:1200]}\n"
+        f"最近一次结果（统一格式）：\n"
+        f"  工具: {tool_name}\n"
+        f"  状态: {'成功' if tool_ok else '失败'}\n"
+        f"  关键数据: {data_summary_str}\n"
+        f"  错误: {tool_error or '无'}\n"
+        f"  输出长度: stdout={_stdout_len}字节, stderr={_stderr_len}字节\n"
+        f"  stdout_head: {_short(_stdout_head)}\n"
+        f"  stdout_tail: {_short(_stdout_tail)}\n"
+        f"  stderr_head: {_short(_stderr_head)}\n"
+        f"  stderr_tail: {_short(_stderr_tail)}\n"
         f"已知事实: {_json.dumps(facts or {}, ensure_ascii=False)[:1200]}\n\n"
-        "路由集合: decide | repeat_step | skip_step | plan | end\n"
-        "facts_delta 统一命名要求：仅使用 repo_root, project_root, project_name, exec_root 等标准键；不要输出 clone_path/repo_path/work_dir 等旧键。\n"
-        "若克隆完成，请提供 project_root 与 project_name；若已知 repo_root，请补充 exec_root = repo_root。\n"
-        "路径叙述一律以 repo_root/project_root 为参照，不使用绝对盘符路径。\n\n"
-        "如需切换模式，请直接在输出中提供 mode 字段（discover/execute）。可选给出 facts_delta 与 insert_steps。\n\n"
+        "【路由职责】\n"
+        "- 你的主要职责是评估当前步骤的执行结果，决定步骤级路由\n"
+        "- 路由集合: decide | repeat_step | skip_step | end\n"
+        "- 仅在**极少数情况**下使用 route: \"plan\"（完全重规划）\n\n"
+        "【模式切换规则】\n"
+        "- discover 模式：收集项目信息（克隆、列目录、读取配置文件）\n"
+        "- execute 模式：执行安装/构建/运行操作\n"
+        "- 切换到 execute 的条件（满足以下**任一组合**即可）：\n"
+        "  组合 A（标准 Python 项目）：\n"
+        "    1. 已确认 project_root 存在（facts 中有 project_root）\n"
+        "    2. 已确认至少一个依赖声明文件（has_setup_py=true 或 has_pyproject=true）\n"
+        "  组合 B（有 requirements.txt）：\n"
+        "    1. 已确认 project_root 存在\n"
+        "    2. 已确认 requirements.txt 存在\n"
+        "  组合 C（README 明确说明）：\n"
+        "    1. 已确认 project_root 存在\n"
+        "    2. 已读取 README 且其中包含明确的安装命令\n"
+        "- **关键判断点**：\n"
+        "  * 当读取 setup.py 或 pyproject.toml 后，如果文件内容包含依赖信息，应切换到 execute\n"
+        "  * 不要等待读取 README，setup.py/pyproject.toml 本身就足够了\n"
+        "  * 如果当前步骤是计划中的最后一个 discover 步骤，应主动切换模式\n"
+        "- 模式切换会触发重规划，但这是必要的流程，不要过度犹豫\n\n"
+        "【facts_delta 规范与逻辑推理】\n"
+        "- 统一命名：仅使用 repo_root, project_root, project_name, exec_root 等标准键\n"
+        "- 不要输出 clone_path/repo_path/work_dir 等旧键\n"
+        "- 若克隆完成，请提供 project_root 与 project_name\n"
+        "- 若已知 repo_root，请补充 exec_root = repo_root\n"
+        "- 路径叙述一律以 repo_root/project_root 为参照，不使用绝对盘符路径\n\n"
+        "【关键逻辑推理规则】\n"
+        "1. **目录状态判断**：\n"
+        "   - 如果 files_list 返回 entries=[] → work_dir_empty=true\n"
+        "   - 如果 files_list 返回 entries=[...] 且数组不为空 → work_dir_empty=false\n"
+        "   - **重要**：看到目标仓库目录已存在时，必须设置 project_root 指向该目录\n"
+        "   - **示例推理**：entries包含 'Real-Time-Voice-Cloning' → work_dir_empty=false, project_root='repo_root/Real-Time-Voice-Cloning'\n"
+        "2. **仓库状态推理**：\n"
+        "   - 如果 git clone 报错 'already exists' → 仓库已存在，设置 project_root\n"
+        "   - **推理过程**：看到错误信息 → 分析原因 → 更新facts → 决定下一步\n"
+        "   - 如果看到目录列表包含目标仓库名 → 仓库已存在，更新 project_root\n"
+        "3. **文件存在性判断**：\n"
+        "   - files_exists 返回 exists=true → has_xxx=true\n"
+        "   - files_exists 返回 exists=false → has_xxx=false\n"
+        "   - 读取文件成功 → 对应的 has_xxx=true, xxx_read=true\n"
+        "4. **逻辑一致性检查**：\n"
+        "   - 在设置facts_delta前，检查与已有facts的一致性\n"
+        "   - 如果发现矛盾，优先相信最新的工具结果\n"
+        "   - **示例**：如果工具显示目录不为空，但facts中work_dir_empty=true，应更新为false\n\n"
+        "【输出格式】\n"
         "仅输出 JSON：{\n"
-        "  \"route\": \"decide|repeat_step|skip_step|plan|end\",\n"
+        "  \"route\": \"decide|repeat_step|skip_step|end\",\n"
         "  \"mode\": \"discover|execute\" | null,\n"
         "  \"facts_delta\": { } | null,\n"
-        "  \"notes\": \"一句话原因\",\n"
-        "  \"insert_steps\": [{\"title\":\"...\",\"instruction\":\"...\"}] | null\n"
-        "}"
+        "  \"success\": true | false | null,\n"
+        "  \"notes\": \"一句话原因\"\n"
+        "}\n\n"
+        "若无法判断，请将 success 设为 false，并说明需要哪些关键信息。"
     )
-    debug.note("observer_prompt", prompt)
+    # debug.note("observer_prompt", prompt)  # 提示词太长，不记录
     try:
         resp = llm_completion(prompt, temperature=0.2, max_tokens=400).strip()
     except Exception:

@@ -78,25 +78,46 @@ class DebugInfoManager:
         rec.return_value = return_value
         rec.exception = exception
 
-        # 打印
+        # 构建日志内容
         duration_ms = int((rec.end_ts - rec.start_ts) * 1000) if rec.end_ts else -1
-        print(f"=== 调试 · {rec.tag} · {rec.func_name} · {duration_ms}ms ===")
+        lines = [f"=== 调试 · {rec.tag} · {rec.func_name} · {duration_ms}ms ==="]
 
-        safe_args = _redact(rec.args)
+        # 只输出kwargs（args通常为空或不重要）
         safe_kwargs = _redact(rec.kwargs)
-        print(f"入参(args): {_safe_serialize(safe_args)}")
-        print(f"入参(kwargs): {_safe_serialize(safe_kwargs)}")
+        if safe_kwargs:
+            lines.append(f"入参: {_safe_serialize(safe_kwargs, limit=400)}")
 
         if rec.notes:
-            print("中间记录(notes):")
+            lines.append("关键信息:")
             for n in rec.notes:
-                print(f"  - {n.get('key')}: {_safe_serialize(_redact(n.get('value')))}")
+                key = n.get('key', '')
+                # 跳过prompt（太长且无用）
+                if 'prompt' in key.lower():
+                    continue
+                val = n.get('value')
+                # 对raw_resp等响应类信息，限制在200字符
+                limit = 200 if 'resp' in key.lower() else 300
+                lines.append(f"  • {key}: {_safe_serialize(_redact(val), limit=limit)}")
 
         if rec.exception is not None:
-            print(f"异常: {type(rec.exception).__name__}: {rec.exception}")
+            lines.append(f"❌ 异常: {type(rec.exception).__name__}: {rec.exception}")
         else:
-            print(f"返回: {_safe_serialize(_redact(rec.return_value))}")
-        print("-" * 60)
+            # 对返回值进行精简，特别是JSON字符串
+            ret_str = _safe_serialize(_redact(rec.return_value), limit=500)
+            lines.append(f"✓ 返回: {ret_str}")
+        lines.append("-" * 60)
+        
+        # 写入文件
+        try:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            with open(".agent_debug.log", "a", encoding="utf-8") as f:
+                f.write(f"\n[{ts}]\n")
+                f.write("\n".join(lines))
+                f.write("\n")
+        except Exception:
+            # 如果文件写入失败，回退到控制台输出
+            for line in lines:
+                print(line)
 
     # 追加：将任意对象（如完整 state）以 JSON 形式写入日志文件
     def write_json_log(self, payload: Any, file_path: Optional[str] = None) -> None:

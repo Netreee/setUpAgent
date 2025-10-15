@@ -53,7 +53,7 @@ class ProjectConfig(BaseSettings):
     data_dir: str = Field(default="./data", description="数据存储目录")
     cache_dir: str = Field(default="./cache", description="缓存目录")
     logs_dir: str = Field(default="./logs", description="日志目录")
-    agent_work_root: str = Field(default="./agent_work", description="Agent工作目录根路径")
+    agent_work_root: str = Field(default="D:\\0APython\\setUpAgent", description="Agent工作目录根路径")
 
     # Agent配置
     default_user_message: str = Field(

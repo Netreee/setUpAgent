@@ -1,48 +1,7 @@
 from typing import Any, Dict, List
 import json
 
-from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, ToolMessage
-
-from run_singleV2 import run_single as run_single_v2
-from agent.debug import dispInfo, debug
-from agent.async_utils import run_coro_sync
-import json
-
-
-@tool("run_instruction")
-# @dispInfo("tool")
-def RUN_INSTRUCTION_TOOL(nl_instruction: str, timeout: int = 60, session_token: str | None = None) -> str:
-    """
-    将自然语言指令转换为单条可执行命令并在持久 PowerShell 会话中执行（V2）。
-    返回JSON字符串：{"exit_code": int, "stdout": str, "stderr": str, "command": str, "work_dir": str, "session_token": str}
-    """
-    debug.note("nl_instruction", nl_instruction)
-    debug.note("timeout", timeout)
-    debug.note("session_token_in", session_token or "<none>")
-
-    try:
-        token, result = run_coro_sync(
-            run_single_v2(nl_instruction, timeout=timeout, session_token=session_token),
-            timeout=timeout + 5,
-        )
-        # 附带会话 token 以便上层保存
-        result = {**result, "session_token": token}
-        debug.note("session_token_out", token)
-        debug.note("run_single_result", result)
-        return json.dumps(result, ensure_ascii=False)
-    except Exception as e:
-        # 工具内部异常时也返回结构化JSON，便于上层观察与重规划
-        err_result: Dict[str, Any] = {
-            "exit_code": 1,
-            "stdout": "",
-            "stderr": f"{type(e).__name__}: {e}",
-            "command": "",
-            "work_dir": "",
-            "session_token": session_token,
-        }
-        debug.note("run_single_error", str(e))
-        return json.dumps(err_result, ensure_ascii=False)
 
 
 def make_tool_call_message(nl_instruction: str, timeout: int = 60, session_token: str | None = None) -> AIMessage:
@@ -54,6 +13,20 @@ def make_tool_call_message(nl_instruction: str, timeout: int = 60, session_token
                 "name": "run_instruction",
                 "args": {"nl_instruction": nl_instruction, "timeout": timeout, "session_token": session_token},
                 "id": "call_run_instruction",
+            }
+        ],
+    )
+
+
+def make_generic_tool_call_message(tool_name: str, tool_args: Dict[str, Any] | None = None) -> AIMessage:
+    """构造一个通用的工具调用AI消息，支持任意已注册工具名称与参数。"""
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": tool_name,
+                "args": dict(tool_args or {}),
+                "id": f"call_{tool_name}",
             }
         ],
     )

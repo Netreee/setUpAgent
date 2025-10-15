@@ -35,9 +35,15 @@ def run_coro_sync(awaitable: Awaitable[Any], timeout: Optional[float] = None) ->
     在后台事件循环中运行协程，并在当前线程同步等待结果。
 
     注意：协程自身可实现超时控制；如需外部超时，可传入 timeout。
+    超时时会尝试取消底层协程。
     """
     loop = ensure_background_loop()
     fut = asyncio.run_coroutine_threadsafe(awaitable, loop)
-    return fut.result(timeout=timeout)
+    try:
+        return fut.result(timeout=timeout)
+    except TimeoutError:
+        # 超时时取消底层的 Future，避免协程继续在后台运行
+        fut.cancel()
+        raise
 
 
