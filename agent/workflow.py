@@ -23,6 +23,7 @@ from tools import (
     GIT_ENSURE_CLONED_TOOL,
 )
 from agent.observer import observe, observe_v2
+from agent.discover_react import run_discover_react
 import os
 import re
 from agent.executor import decide_next_action
@@ -109,6 +110,60 @@ def plan_node(state: AgentState) -> AgentState:
         "finished_titles": list(state.get("finished_titles", [])),
         # 保存本次规划时的模式，用于下次检测模式切换
         "_last_plan_mode": curr_mode,
+    }
+
+
+@dispInfo("workflow")
+def discover_node(state: AgentState) -> AgentState:
+    """
+    Discover entry node: run the ReAct discover agent once to collect facts and a summary,
+    then hand control to planner/decider pipeline.
+    """
+    goal = None
+    try:
+        goal = state.get("task", {}).get("goal")
+    except Exception:
+        goal = None
+    if not goal:
+        messages = state.get("messages", [])
+        goal = messages[-1]["content"] if messages else ""
+
+    seed_facts = {}
+    try:
+        seed_facts = dict(state.get("facts", {}) or {})
+    except Exception:
+        seed_facts = {}
+
+    try:
+        out = run_discover_react(goal, seed_facts=seed_facts)
+    except Exception as e:
+        out = {"facts": seed_facts, "summary": f"(discover failed) {type(e).__name__}: {e}", "transcript": []}
+
+    facts = dict(out.get("facts", {}) or {})
+    discover_summary = str(out.get("summary", ""))
+    discover_transcript = list(out.get("transcript", []) or [])
+
+    # Normalize minimal expected keys
+    try:
+        if "repo_path" in facts and not facts.get("repo_root"):
+            facts["repo_root"] = facts.pop("repo_path")
+        if facts.get("repo_root") and not facts.get("exec_root"):
+            facts["exec_root"] = facts["repo_root"]
+        facts.pop("work_dir", None)
+    except Exception:
+        pass
+
+    return {
+        **state,
+        "facts": facts,
+        "discover_summary": discover_summary,
+        "discover_transcript": discover_transcript,
+        # Set default mode to execute after discover; subsequent planning will rely on facts
+        "mode": "execute",
+        "episode": int(state.get("episode", 1) or 1),
+        "route": "plan",
+        "replan_requested": True,
+        "observation": "已完成 ReAct 发现阶段并写入 facts",
     }
 
 
@@ -537,8 +592,9 @@ def observe_node(state: AgentState) -> AgentState:
 
 
 def create_task_graph():
-    """构建任务执行 LangGraph 工作流（plan → decide → execute → observe → (END|plan|decide)）。"""
+    """构建任务执行 LangGraph 工作流（discover → plan → decide → execute → observe → (END|plan|decide)）。"""
     workflow = StateGraph(AgentState)
+    workflow.add_node("discover", discover_node)
     workflow.add_node("plan", plan_node)
     # 决策节点：决定下一步调用的工具或是否重规划
     workflow.add_node("decide", decide_node)
@@ -559,7 +615,8 @@ def create_task_graph():
     ]))
     workflow.add_node("observe", observe_node)
 
-    workflow.set_entry_point("plan")
+    workflow.set_entry_point("discover")
+    workflow.add_edge("discover", "plan")
     workflow.add_edge("plan", "decide")
     
     # decide节点的条件路由：根据决策结果决定是执行工具还是重规划

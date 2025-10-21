@@ -14,6 +14,10 @@ from tools import (
     FILES_LIST_TOOL,
     FILES_READ_TOOL,
     FILES_FIND_TOOL,
+    FILES_READ_SECTION_TOOL,
+    FILES_READ_RANGE_TOOL,
+    FILES_GREP_TOOL,
+    MD_OUTLINE_TOOL,
     PYENV_PYTHON_INFO_TOOL,
     PYENV_TOOL_VERSIONS_TOOL,
     PYENV_PARSE_PYPROJECT_TOOL,
@@ -47,20 +51,22 @@ SYSTEM_PROMPT = (
     "你是一个只读的项目侦察代理。你的任务是逐步理解工作区中的项目结构，"
     "并在自认为信息充分时给出清晰的\"安装与运行方案\"总结。\n\n"
     "规则：\n"
-    "- 只使用以下已注册的只读工具：files_list, files_read, files_exists, files_find, files_stat, "
+    "- 只使用以下已注册的只读工具：files_list, files_read, files_read_section, files_read_range, files_grep, md_outline, files_exists, files_find, files_stat, "
     "pyenv_python_info, pyenv_tool_versions, pyenv_parse_pyproject, git_repo_status\n"
     "- 严禁执行修改性操作（不得调用 run_instruction、git_ensure_cloned 等）\n"
     "- 路径参数使用相对路径或 'repo_root' 占位符（工具会自动解析为工作区根目录）\n"
     "- **策略**：先 files_list 获取全貌 → 根据 list 结果中的\"关键文件\"决定后续步骤 → 避免盲目试探\n"
     "- **关键点**：files_list 的 Observation 会突出显示 pyproject.toml/setup.py/requirements.txt 等关键文件，请优先关注\n"
     "- **结束条件**：获得依赖信息（pyproject 或 requirements.txt）+ 可选的 README 关键信息后，即可 finish\n\n"
-    "对话格式（轻量，不是硬表单）：\n"
+    "对话格式：\n"
     "Thought: 你的推理\n"
     "Action: <tool_name>(arg1=value1, arg2=value2)  或  finish\n\n"
     "路径示例：\n"
     "- files_list(path=\"repo_root\")  # 列出工作区根目录（会突出显示关键文件）\n"
     "- files_read(path=\"repo_root/README.md\", mode=\"head\")  # 读取 README 头部\n"
-    "- pyenv_parse_pyproject(pyproject_path=\"pyproject.toml\")  # 解析 pyproject.toml（使用相对路径）\n"
+    "- md_outline(path=\"repo_root/README.md\")  # 提取 Markdown 目录，用于定位小节\n"
+    "- files_read_section(path=\"repo_root/README.md\", start_line=20, end_line=80)  # 精准读取小节\n"
+    "- pyenv_parse_pyproject(pyproject_path=\"pyproject.toml\")  # 解析 pyproject.toml（使用相对路径）\n" 
 )
 
 
@@ -188,10 +194,7 @@ def react_node(state: DiscoverState) -> DiscoverState:
             print(f"Last action: {last.get('action', '')[:80]}")
             print(f"Last observation: {str(last.get('observation', ''))[:150]}...")
 
-    try:
-        model_out = llm_completion(prompt, temperature=0.2, max_tokens=400).strip()
-    except Exception:
-        model_out = "Thought: 读取 repo_root 列表以了解项目根结构\nAction: files_list(path=\"repo_root\")"
+    model_out = llm_completion(prompt, temperature=0.2, max_tokens=400).strip()
 
     # Split out Thought and Action lines (best-effort)
     thought = ""
@@ -244,6 +247,10 @@ def react_node(state: DiscoverState) -> DiscoverState:
             "files_list",
             "files_read",
             "files_find",
+            "files_read_section",
+            "files_read_range",
+            "files_grep",
+            "md_outline",
             "pyenv_python_info",
             "pyenv_tool_versions",
             "pyenv_parse_pyproject",
@@ -313,7 +320,7 @@ def observe_node(state: DiscoverState) -> DiscoverState:
             truncated = data.get("truncated", False)
             dir_path = data.get("dir", "")
             
-            # Categorize entries for better readability
+            # Categorize entries for better readability 
             key_files = []  # Important config files
             py_files = []
             dirs = []
@@ -367,6 +374,30 @@ def observe_node(state: DiscoverState) -> DiscoverState:
             transcript[-1]["observation"] = llm_observation
         except Exception:
             pass
+
+    # Align facts handling with unified observer: compute facts_delta and normalize
+    try:
+        from agent.observer import observe_v2
+        task_ctx = {"goal": state.get("goal", ""), "steps": [{"title": "discover"}]}
+        route_decision = observe_v2(task_ctx, 0, last, mode="discover", episode=1, facts=state.get("facts", {}))
+        facts = dict(state.get("facts", {}))
+        try:
+            delta = route_decision.get("facts_delta") or {}
+            if isinstance(delta, dict):
+                facts.update(delta)
+        except Exception:
+            pass
+        # Normalize minimal expected keys
+        if "repo_path" in facts and not facts.get("repo_root"):
+            facts["repo_root"] = facts.pop("repo_path")
+        if facts.get("repo_root") and not facts.get("exec_root"):
+            facts["exec_root"] = facts["repo_root"]
+        facts.pop("work_dir", None)
+        state = {**state, "facts": facts}
+    except Exception:
+        # facts extraction is best-effort; ignore failures
+        pass
+
     return {**state, "transcript": transcript, "route": "react"}
 
 
@@ -438,6 +469,10 @@ def create_discover_graph():
                 FILES_LIST_TOOL,
                 FILES_READ_TOOL,
                 FILES_FIND_TOOL,
+                FILES_READ_SECTION_TOOL,
+                FILES_READ_RANGE_TOOL,
+                FILES_GREP_TOOL,
+                MD_OUTLINE_TOOL,
                 PYENV_PYTHON_INFO_TOOL,
                 PYENV_TOOL_VERSIONS_TOOL,
                 PYENV_PARSE_PYPROJECT_TOOL,

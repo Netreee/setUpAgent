@@ -86,5 +86,8 @@ class AgentState(TypedDict, total=False):
     READMEinfo: dict
     # 由 observer 维护：已完成步骤的标题集合（用于 planner 提示防止重复）
     finished_titles: list[str]
+    # ReAct 发现阶段的产出
+    discover_summary: str
+    discover_transcript: list[dict]
 
 

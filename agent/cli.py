@@ -28,6 +28,11 @@ def run(goal: str, recursion_limit: int = 100):
         "observation": "",
         "is_complete": False,
         "failed": False,
+        # 初始化为执行模式；facts 由 discover_react 节点填充
+        "mode": "execute",
+        "episode": 1,
+        "facts": {},
+        "finished_titles": [],
     }
 
     step = 1

@@ -12,6 +12,7 @@ from config import get_config
 from utils import normalize_facts
 from agent.debug import dispInfo, debug
 from tools.base import tool_response
+import re
 
 
 def _get_workspace_root() -> Path:
@@ -404,3 +405,337 @@ def FILES_FIND_TOOL(start_dir: str, include_globs: Optional[List[str]] = None, e
         )
 
 
+
+@tool("files_read_section")
+@dispInfo("fs_read_section")
+def FILES_READ_SECTION_TOOL(path: str, start_line: int, end_line: int, max_chars: int = 262144) -> str:
+    """Read lines in [start_line, end_line] (1-based, inclusive). Returns content and metadata.
+
+    If the section exceeds max_chars, it will be truncated and flagged.
+    """
+    ok, violation, p = _resolve_and_guard(path)
+    if not ok or p is None:
+        return tool_response(
+            tool="files_read_section",
+            ok=False,
+            data={"path": str(path), "content": ""},
+            error=violation or "unknown_error",
+        )
+    try:
+        if not p.exists() or not p.is_file():
+            return tool_response(
+                tool="files_read_section",
+                ok=False,
+                data={"path": str(p), "content": ""},
+                error="not_a_file",
+            )
+        s = 1 if start_line is None or start_line < 1 else int(start_line)
+        e = int(end_line) if end_line is not None and end_line >= s else s - 1
+        if e < s:
+            return tool_response(
+                tool="files_read_section",
+                ok=True,
+                data={
+                    "path": str(p),
+                    "start_line": s,
+                    "end_line": e,
+                    "content": "",
+                    "encoding": "utf-8",
+                    "size": 0,
+                    "truncated": False,
+                },
+            )
+        collected: List[str] = []
+        truncated = False
+        char_count = 0
+        # Stream lines to avoid loading whole file
+        with open(p, "rb") as f:
+            # decode line by line
+            current_line_no = 0
+            for raw in f:
+                try:
+                    line = raw.decode("utf-8", errors="replace")
+                    enc = "utf-8"
+                except Exception:
+                    try:
+                        line = raw.decode("latin-1", errors="replace")
+                        enc = "latin-1"
+                    except Exception:
+                        line = ""
+                        enc = "binary"
+                current_line_no += 1
+                if current_line_no < s:
+                    continue
+                if current_line_no > e:
+                    break
+                # enforce max_chars budget
+                need = max_chars - char_count
+                if need <= 0:
+                    truncated = True
+                    break
+                if len(line) <= need:
+                    collected.append(line)
+                    char_count += len(line)
+                else:
+                    collected.append(line[:need])
+                    char_count += need
+                    truncated = True
+                    break
+        content = "".join(collected)
+        return tool_response(
+            tool="files_read_section",
+            ok=True,
+            data={
+                "path": str(p),
+                "start_line": s,
+                "end_line": e,
+                "content": content,
+                "encoding": enc if 'enc' in locals() else "utf-8",
+                "size": len(content),
+                "truncated": bool(truncated),
+            },
+        )
+    except Exception as e:
+        return tool_response(
+            tool="files_read_section",
+            ok=False,
+            data={"path": str(p), "content": ""},
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
+@tool("files_read_range")
+@dispInfo("fs_read_range")
+def FILES_READ_RANGE_TOOL(path: str, offset: int, length: int) -> str:
+    """Read a byte range [offset, offset+length). Returns decoded content.
+
+    truncated=True indicates there is more data after the requested range.
+    """
+    ok, violation, p = _resolve_and_guard(path)
+    if not ok or p is None:
+        return tool_response(
+            tool="files_read_range",
+            ok=False,
+            data={"path": str(path), "content": ""},
+            error=violation or "unknown_error",
+        )
+    try:
+        if not p.exists() or not p.is_file():
+            return tool_response(
+                tool="files_read_range",
+                ok=False,
+                data={"path": str(p), "content": ""},
+                error="not_a_file",
+            )
+        size = p.stat().st_size
+        off = max(0, int(offset or 0))
+        ln = max(0, int(length or 0))
+        if ln == 0 or off >= size:
+            return tool_response(
+                tool="files_read_range",
+                ok=True,
+                data={
+                    "path": str(p),
+                    "offset": off,
+                    "length": ln,
+                    "content": "",
+                    "encoding": "utf-8",
+                    "size": 0,
+                    "truncated": False,
+                },
+            )
+        with open(p, "rb") as f:
+            f.seek(off)
+            data = f.read(ln)
+        try:
+            text = data.decode("utf-8", errors="replace")
+            encoding = "utf-8"
+        except Exception:
+            try:
+                text = data.decode("latin-1", errors="replace")
+                encoding = "latin-1"
+            except Exception:
+                text = ""
+                encoding = "binary"
+        end_pos = off + len(data)
+        truncated = end_pos < size
+        return tool_response(
+            tool="files_read_range",
+            ok=True,
+            data={
+                "path": str(p),
+                "offset": off,
+                "length": ln,
+                "content": text,
+                "encoding": encoding,
+                "size": len(text),
+                "truncated": bool(truncated),
+            },
+        )
+    except Exception as e:
+        return tool_response(
+            tool="files_read_range",
+            ok=False,
+            data={"path": str(p), "content": ""},
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
+@tool("files_grep")
+@dispInfo("fs_grep")
+def FILES_GREP_TOOL(start_dir: str, patterns: List[str], first_only: bool = False, include_globs: Optional[List[str]] = None, limit: int = 500) -> str:
+    """Search recursively for regex patterns in text files.
+
+    Returns a list of matches: {path, line_no, line, pattern}. Truncates after limit matches.
+    """
+    ok, violation, p = _resolve_and_guard(start_dir)
+    if not ok or p is None:
+        return tool_response(
+            tool="files_grep",
+            ok=False,
+            data={"start_dir": str(start_dir), "matches": []},
+            error=violation or "unknown_error",
+        )
+    if not p.exists() or not p.is_dir():
+        return tool_response(
+            tool="files_grep",
+            ok=False,
+            data={"start_dir": str(p), "matches": []},
+            error="not_a_directory",
+        )
+    try:
+        pats = [re.compile(pat, re.MULTILINE) for pat in (patterns or [])]
+        globs = list(include_globs or [])
+        matches: List[Dict[str, Any]] = []
+        truncated = False
+        for base, dirs, files in os.walk(p):
+            base_path = Path(base)
+            for name in files:
+                fp = base_path / name
+                if globs:
+                    if not any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(str(fp), g) for g in globs):
+                        continue
+                # Best-effort text read
+                try:
+                    with open(fp, "rb") as f:
+                        data = f.read()
+                    try:
+                        text = data.decode("utf-8", errors="replace")
+                    except Exception:
+                        text = data.decode("latin-1", errors="replace")
+                except Exception:
+                    continue
+                lines = text.splitlines()
+                for idx, line in enumerate(lines, start=1):
+                    for pat in pats:
+                        if pat.search(line):
+                            matches.append({
+                                "path": str(fp),
+                                "line_no": idx,
+                                "line": line[:400],
+                                "pattern": pat.pattern,
+                            })
+                            if first_only:
+                                return tool_response(
+                                    tool="files_grep",
+                                    ok=True,
+                                    data={
+                                        "start_dir": str(p),
+                                        "matches": matches,
+                                        "truncated": False,
+                                        "patterns": [pt.pattern for pt in pats],
+                                    },
+                                )
+                            if len(matches) >= limit:
+                                truncated = True
+                                break
+                    if truncated:
+                        break
+                if truncated:
+                    break
+            if first_only or truncated:
+                break
+        return tool_response(
+            tool="files_grep",
+            ok=True,
+            data={
+                "start_dir": str(p),
+                "matches": matches,
+                "truncated": truncated,
+                "patterns": [pt.pattern for pt in pats],
+            },
+        )
+    except Exception as e:
+        return tool_response(
+            tool="files_grep",
+            ok=False,
+            data={"start_dir": str(p), "matches": []},
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
+@tool("md_outline")
+@dispInfo("md_outline")
+def MD_OUTLINE_TOOL(path: str) -> str:
+    """Extract Markdown headings (#..######) and compute section ranges.
+
+    Returns sections: [{level, title, line_no, start_line, end_line}].
+    """
+    ok, violation, p = _resolve_and_guard(path)
+    if not ok or p is None:
+        return tool_response(
+            tool="md_outline",
+            ok=False,
+            data={"path": str(path), "sections": []},
+            error=violation or "unknown_error",
+        )
+    try:
+        if not p.exists() or not p.is_file():
+            return tool_response(
+                tool="md_outline",
+                ok=False,
+                data={"path": str(p), "sections": []},
+                error="not_a_file",
+            )
+        with open(p, "rb") as f:
+            data = f.read()
+        try:
+            text = data.decode("utf-8", errors="replace")
+        except Exception:
+            text = data.decode("latin-1", errors="replace")
+        lines = text.splitlines()
+        headers: List[Dict[str, Any]] = []
+        for idx, line in enumerate(lines, start=1):
+            m = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+            if m:
+                level = len(m.group(1))
+                title = m.group(2).strip()
+                headers.append({"level": level, "title": title, "line_no": idx})
+        # compute ranges
+        sections: List[Dict[str, Any]] = []
+        for i, h in enumerate(headers):
+            start_ln = h["line_no"]
+            end_ln = len(lines)
+            for j in range(i + 1, len(headers)):
+                if headers[j]["level"] <= h["level"]:
+                    end_ln = headers[j]["line_no"] - 1
+                    break
+            sections.append({
+                "level": h["level"],
+                "title": h["title"],
+                "line_no": h["line_no"],
+                "start_line": start_ln,
+                "end_line": end_ln,
+            })
+        return tool_response(
+            tool="md_outline",
+            ok=True,
+            data={"path": str(p), "sections": sections, "count": len(sections)},
+        )
+    except Exception as e:
+        return tool_response(
+            tool="md_outline",
+            ok=False,
+            data={"path": str(p), "sections": []},
+            error=f"{type(e).__name__}: {e}",
+        )

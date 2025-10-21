@@ -21,6 +21,10 @@ from tools import (
     FILES_LIST_TOOL,
     FILES_READ_TOOL,
     FILES_FIND_TOOL,
+    FILES_READ_SECTION_TOOL,
+    FILES_READ_RANGE_TOOL,
+    FILES_GREP_TOOL,
+    MD_OUTLINE_TOOL,
     PYENV_PYTHON_INFO_TOOL,
     PYENV_TOOL_VERSIONS_TOOL,
     PYENV_PARSE_PYPROJECT_TOOL,
@@ -47,14 +51,14 @@ def test_fs_exists_and_stat(_env_repo_root: Path):
     p.write_text("hello", encoding="utf-8")
 
     res = _loads(FILES_EXISTS_TOOL.invoke({"path": "a.txt"}))
-    assert res["ok"] is True and res["exists"] is True
+    assert res["ok"] is True and res["data"]["exists"] is True
     assert str(p).replace("\\", "/").endswith("/a.txt")
 
     st_file = _loads(FILES_STAT_TOOL.invoke({"path": "a.txt"}))
-    assert st_file["ok"] is True and st_file["type"] == "file" and st_file["size"] > 0
+    assert st_file["ok"] is True and st_file["data"]["type"] == "file" and st_file["data"]["size"] > 0
 
     st_missing = _loads(FILES_STAT_TOOL.invoke({"path": "nope.txt"}))
-    assert st_missing["ok"] is True and st_missing["type"] == "missing"
+    assert st_missing["ok"] is True and st_missing["data"]["type"] == "missing"
 
 
 def test_fs_list_read_find(_env_repo_root: Path):
@@ -73,19 +77,19 @@ def test_fs_list_read_find(_env_repo_root: Path):
             {"path": ".", "files_only": True, "recurse": True, "patterns": ["*.txt"], "limit": 10}
         )
     )
-    names = {e["name"] for e in lst["entries"]}
+    names = {e["name"] for e in lst["data"]["entries"]}
     assert {"a.txt", "b.txt", "c.txt"}.issubset(names)
-    assert lst["truncated"] is False
+    assert lst["data"]["truncated"] is False
 
     # files_read: raw/head/tail
     raw = _loads(FILES_READ_TOOL.invoke({"path": "a.txt", "mode": "raw", "max_bytes": 5}))
-    assert raw["ok"] is True and raw["truncated"] is True and raw["content"] == "A" * 5
+    assert raw["ok"] is True and raw["data"]["truncated"] is True and raw["data"]["content"] == "A" * 5
 
     head = _loads(FILES_READ_TOOL.invoke({"path": "a.txt", "mode": "head", "max_bytes": 3}))
-    assert head["content"] == "A" * 3 and head["truncated"] is True
+    assert head["data"]["content"] == "A" * 3 and head["data"]["truncated"] is True
 
     tail = _loads(FILES_READ_TOOL.invoke({"path": "a.txt", "mode": "tail", "max_bytes": 4}))
-    assert tail["content"] == "A" * 4 and tail["truncated"] is True
+    assert tail["data"]["content"] == "A" * 4 and tail["data"]["truncated"] is True
 
     # files_find: include/exclude/first_only
     found = _loads(
@@ -93,14 +97,34 @@ def test_fs_list_read_find(_env_repo_root: Path):
             {"start_dir": ".", "include_globs": ["*.txt"], "exclude_globs": ["b.*"], "first_only": False}
         )
     )
-    assert found["ok"] is True and any(x.endswith("a.txt") for x in found["results"]) and not any(
-        x.endswith("b.txt") for x in found["results"]
+    assert found["ok"] is True and any(x.endswith("a.txt") for x in found["data"]["matches"]) and not any(
+        x.endswith("b.txt") for x in found["data"]["matches"]
     )
 
     first = _loads(
         FILES_FIND_TOOL.invoke({"start_dir": ".", "include_globs": ["*.txt"], "first_only": True})
     )
-    assert first["ok"] is True and len(first["results"]) == 1
+    assert first["ok"] is True and len(first["data"]["matches"]) == 1
+
+    # files_read_section: extract specific lines
+    sec = _loads(FILES_READ_SECTION_TOOL.invoke({"path": "a.txt", "start_line": 1, "end_line": 1}))
+    assert sec["ok"] is True and sec["data"]["content"].startswith("A") and len(sec["data"]["content"]) >= 1
+
+    # files_read_range: byte-range read
+    rng = _loads(FILES_READ_RANGE_TOOL.invoke({"path": "a.txt", "offset": 0, "length": 5}))
+    assert rng["ok"] is True and rng["data"]["content"] == "A" * 5 and rng["data"]["truncated"] is True
+
+    # files_grep: regex search
+    grep = _loads(
+        FILES_GREP_TOOL.invoke({"start_dir": ".", "patterns": ["^A+$"], "include_globs": ["*.txt"], "first_only": True})
+    )
+    assert grep["ok"] is True and grep["data"]["matches"] and grep["data"]["matches"][0]["line"].startswith("A")
+
+    # md_outline: build headings index
+    md = _env_repo_root / "README.md"
+    md.write_text("# Title\n\n## Sec1\ntext\n\n## Sec2\n", encoding="utf-8")
+    outline = _loads(MD_OUTLINE_TOOL.invoke({"path": "README.md"}))
+    assert outline["ok"] is True and outline["data"]["count"] >= 3
 
 
 def test_pyenv_python_info_and_parse(monkeypatch: pytest.MonkeyPatch, _env_repo_root: Path):
